@@ -193,6 +193,10 @@ func (channel *Channel) SaveChannelInfo() error {
 	return DB.Model(channel).Update("channel_info", channel.ChannelInfo).Error
 }
 
+func (channel *Channel) SaveOtherSettings() error {
+	return DB.Model(channel).Update("settings", channel.OtherSettings).Error
+}
+
 func (channel *Channel) GetModels() []string {
 	if channel.Models == "" {
 		return []string{}
@@ -355,13 +359,13 @@ func GetChannelById(id int, selectAll bool) (*Channel, error) {
 	return channel, nil
 }
 
-func BatchInsertChannels(channels []Channel) error {
+func BatchInsertChannels(channels []Channel) ([]Channel, error) {
 	if len(channels) == 0 {
-		return nil
+		return nil, nil
 	}
 	tx := DB.Begin()
 	if tx.Error != nil {
-		return tx.Error
+		return nil, tx.Error
 	}
 	defer func() {
 		if r := recover(); r != nil {
@@ -369,19 +373,27 @@ func BatchInsertChannels(channels []Channel) error {
 		}
 	}()
 
-	for _, chunk := range lo.Chunk(channels, 50) {
+	for start := 0; start < len(channels); start += 50 {
+		end := start + 50
+		if end > len(channels) {
+			end = len(channels)
+		}
+		chunk := channels[start:end]
 		if err := tx.Create(&chunk).Error; err != nil {
 			tx.Rollback()
-			return err
+			return nil, err
 		}
 		for _, channel_ := range chunk {
 			if err := channel_.AddAbilities(tx); err != nil {
 				tx.Rollback()
-				return err
+				return nil, err
 			}
 		}
 	}
-	return tx.Commit().Error
+	if err := tx.Commit().Error; err != nil {
+		return nil, err
+	}
+	return channels, nil
 }
 
 func BatchDeleteChannels(ids []int) error {
@@ -421,14 +433,7 @@ func (channel *Channel) GetWeight() int {
 }
 
 func (channel *Channel) GetBaseURL() string {
-	if channel.BaseURL == nil {
-		return ""
-	}
-	url := *channel.BaseURL
-	if url == "" {
-		url = constant.ChannelBaseURLs[channel.Type]
-	}
-	return url
+	return channel.GetPreferredBaseURL()
 }
 
 func (channel *Channel) GetModelMapping() string {

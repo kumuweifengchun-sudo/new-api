@@ -44,6 +44,8 @@ export default function SettingsMonitoring(props) {
       '100-199,300-399,401-407,409-499,500-503,505-523,525-599',
     'monitor_setting.auto_test_channel_enabled': false,
     'monitor_setting.auto_test_channel_minutes': 10,
+    'monitor_setting.channel_tcp_probe_enabled': true,
+    'monitor_setting.channel_tcp_probe_schedule_time': '02:00',
   });
   const refForm = useRef();
   const [inputsRow, setInputsRow] = useState(inputs);
@@ -72,6 +74,15 @@ export default function SettingsMonitoring(props) {
           ? `: ${parsedAutoRetryStatusCodes.invalidTokens.join(', ')}`
           : '';
       return showError(`${t('自动重试状态码格式不正确')}${details}`);
+    }
+    const probeScheduleValue = String(
+      inputs['monitor_setting.channel_tcp_probe_schedule_time'] || '',
+    ).trim();
+    if (
+      inputs['monitor_setting.channel_tcp_probe_enabled'] &&
+      !/^([01]\d|2[0-3]):([0-5]\d)$/.test(probeScheduleValue)
+    ) {
+      return showError(t('TCP测速时间格式不正确，请使用 HH:mm'));
     }
     const requestQueue = updateArray.map((item) => {
       let value = '';
@@ -160,6 +171,37 @@ export default function SettingsMonitoring(props) {
                       ...inputs,
                       'monitor_setting.auto_test_channel_minutes':
                         parseInt(value),
+                    })
+                  }
+                />
+              </Col>
+            </Row>
+            <Row gutter={16}>
+              <Col xs={24} sm={12} md={8} lg={8} xl={8}>
+                <Form.Switch
+                  field={'monitor_setting.channel_tcp_probe_enabled'}
+                  label={t('定时TCP测速多地址渠道')}
+                  size='default'
+                  checkedText='｜'
+                  uncheckedText='〇'
+                  onChange={(value) =>
+                    setInputs({
+                      ...inputs,
+                      'monitor_setting.channel_tcp_probe_enabled': value,
+                    })
+                  }
+                />
+              </Col>
+              <Col xs={24} sm={12} md={8} lg={8} xl={8}>
+                <Form.Input
+                  field={'monitor_setting.channel_tcp_probe_schedule_time'}
+                  label={t('TCP测速执行时间')}
+                  placeholder='02:00'
+                  extraText={t('按服务器本地时区每日执行，格式为 HH:mm')}
+                  onChange={(value) =>
+                    setInputs({
+                      ...inputs,
+                      'monitor_setting.channel_tcp_probe_schedule_time': value,
                     })
                   }
                 />

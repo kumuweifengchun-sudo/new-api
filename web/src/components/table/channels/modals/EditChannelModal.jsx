@@ -134,6 +134,20 @@ const MODEL_FETCHABLE_TYPES = new Set([
   1, 4, 14, 34, 17, 26, 27, 24, 47, 25, 20, 23, 31, 40, 42, 48, 43,
 ]);
 
+const splitBaseUrlLines = (value) =>
+  String(value || '')
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+const normalizeBaseUrlInput = (value) => {
+  const seen = new Set();
+  return splitBaseUrlLines(value)
+    .map((item) => item.replace(/\/+$/, ''))
+    .filter((item) => item && !seen.has(item) && seen.add(item))
+    .join('\n');
+};
+
 function type2secretPrompt(type) {
   // inputs.type === 15 ? '按照如下格式输入：APIKey|SecretKey' : (inputs.type === 18 ? '按照如下格式输入：APPID|APISecret|APIKey' : '请输入渠道对应的鉴权密钥')
   switch (type) {
@@ -268,6 +282,35 @@ const EditChannelModal = (props) => {
       return [];
     }
   }, [inputs.model_mapping]);
+  const baseURLProbeInfo = useMemo(() => {
+    if (!inputs.settings) {
+      return {
+        preferredBaseURL: '',
+        lastTime: 0,
+        results: [],
+      };
+    }
+    try {
+      const parsed = JSON.parse(inputs.settings);
+      return {
+        preferredBaseURL: parsed.preferred_base_url || '',
+        lastTime: Number(parsed.base_url_probe_last_time) || 0,
+        results: Array.isArray(parsed.base_url_probe_results)
+          ? parsed.base_url_probe_results
+          : [],
+      };
+    } catch (error) {
+      return {
+        preferredBaseURL: '',
+        lastTime: 0,
+        results: [],
+      };
+    }
+  }, [inputs.settings]);
+  const configuredBaseURLs = useMemo(
+    () => splitBaseUrlLines(inputs.base_url),
+    [inputs.base_url],
+  );
   const upstreamDetectedModels = useMemo(
     () =>
       Array.from(
@@ -597,16 +640,19 @@ const EditChannelModal = (props) => {
       value = Array.from(new Set(value.map((m) => (m || '').trim())));
     }
 
-    if (name === 'base_url' && value.endsWith('/v1')) {
-      Modal.confirm({
-        title: '警告',
-        content:
-          '不需要在末尾加/v1，New API会自动处理，添加后可能导致请求失败，是否继续？',
-        onOk: () => {
-          setInputs((inputs) => ({ ...inputs, [name]: value }));
-        },
-      });
-      return;
+    if (name === 'base_url') {
+      const baseURLLines = splitBaseUrlLines(value);
+      if (baseURLLines.length === 1 && baseURLLines[0].endsWith('/v1')) {
+        Modal.confirm({
+          title: '警告',
+          content:
+            '不需要在末尾加/v1，New API会自动处理，添加后可能导致请求失败，是否继续？',
+          onOk: () => {
+            setInputs((inputs) => ({ ...inputs, [name]: value }));
+          },
+        });
+        return;
+      }
     }
     setInputs((inputs) => ({ ...inputs, [name]: value }));
     if (name === 'type') {
@@ -1714,12 +1760,7 @@ const EditChannelModal = (props) => {
       }
     }
 
-    if (localInputs.base_url && localInputs.base_url.endsWith('/')) {
-      localInputs.base_url = localInputs.base_url.slice(
-        0,
-        localInputs.base_url.length - 1,
-      );
-    }
+    localInputs.base_url = normalizeBaseUrlInput(localInputs.base_url);
     if (localInputs.type === 18 && localInputs.other === '') {
       localInputs.other = 'v2.1';
     }
@@ -3249,17 +3290,18 @@ const EditChannelModal = (props) => {
                             className='!rounded-lg'
                           />
                           <div>
-                            <Form.Input
+                            <Form.TextArea
                               field='base_url'
                               label='AZURE_OPENAI_ENDPOINT'
                               placeholder={t(
-                                '请输入 AZURE_OPENAI_ENDPOINT，例如：https://docs-test-001.openai.azure.com',
+                                '请输入 AZURE_OPENAI_ENDPOINT，每行一个，例如：https://docs-test-001.openai.azure.com',
                               )}
                               onChange={(value) =>
                                 handleInputChange('base_url', value)
                               }
                               showClear
                               disabled={isIonetLocked}
+                              autosize
                             />
                           </div>
                           <div>
@@ -3304,17 +3346,18 @@ const EditChannelModal = (props) => {
                             className='!rounded-lg'
                           />
                           <div>
-                            <Form.Input
+                            <Form.TextArea
                               field='base_url'
                               label={t('完整的 Base URL，支持变量{model}')}
                               placeholder={t(
-                                '请输入完整的URL，例如：https://api.openai.com/v1/chat/completions',
+                                '请输入完整的URL，每行一个，例如：https://api.openai.com/v1/chat/completions',
                               )}
                               onChange={(value) =>
                                 handleInputChange('base_url', value)
                               }
                               showClear
                               disabled={isIonetLocked}
+                              autosize
                             />
                           </div>
                         </>
@@ -3336,19 +3379,20 @@ const EditChannelModal = (props) => {
                         inputs.type !== 36 &&
                         (inputs.type !== 45 || doubaoApiEditUnlocked) && (
                           <div>
-                            <Form.Input
+                            <Form.TextArea
                               field='base_url'
                               label={t('API地址')}
                               placeholder={t(
-                                '此项可选，用于通过自定义API地址来进行 API 调用，末尾不要带/v1和/',
+                                '此项可选，用于通过自定义API地址来进行 API 调用。每行一个，末尾不要带/v1和/',
                               )}
                               onChange={(value) =>
                                 handleInputChange('base_url', value)
                               }
                               showClear
                               disabled={isIonetLocked}
+                              autosize
                               extraText={t(
-                                '对于官方渠道，new-api已经内置地址，除非是第三方代理站点或者Azure的特殊接入地址，否则不需要填写',
+                                '对于官方渠道，new-api已经内置地址，除非是第三方代理站点或者Azure的特殊接入地址，否则不需要填写。填写多个地址后会自动TCP测速并优先使用最快地址。',
                               )}
                             />
                           </div>
@@ -3356,36 +3400,38 @@ const EditChannelModal = (props) => {
 
                       {inputs.type === 22 && (
                         <div>
-                          <Form.Input
+                          <Form.TextArea
                             field='base_url'
                             label={t('私有部署地址')}
                             placeholder={t(
-                              '请输入私有部署地址，格式为：https://fastgpt.run/api/openapi',
+                              '请输入私有部署地址，每行一个，格式为：https://fastgpt.run/api/openapi',
                             )}
                             onChange={(value) =>
                               handleInputChange('base_url', value)
                             }
                             showClear
                             disabled={isIonetLocked}
+                            autosize
                           />
                         </div>
                       )}
 
                       {inputs.type === 36 && (
                         <div>
-                          <Form.Input
+                          <Form.TextArea
                             field='base_url'
                             label={t(
                               '注意非Chat API，请务必填写正确的API地址，否则可能导致无法使用',
                             )}
                             placeholder={t(
-                              '请输入到 /suno 前的路径，通常就是域名，例如：https://api.example.com',
+                              '请输入到 /suno 前的路径，每行一个，通常就是域名，例如：https://api.example.com',
                             )}
                             onChange={(value) =>
                               handleInputChange('base_url', value)
                             }
                             showClear
                             disabled={isIonetLocked}
+                            autosize
                           />
                         </div>
                       )}
@@ -3420,6 +3466,54 @@ const EditChannelModal = (props) => {
                             disabled={isIonetLocked}
                           />
                         </div>
+                      )}
+
+                      {isEdit && configuredBaseURLs.length > 1 && (
+                        <Banner
+                          type='info'
+                          description={
+                            <div className='flex flex-col gap-2'>
+                              <Text>
+                                {t('当前最优地址')}:{' '}
+                                {baseURLProbeInfo.preferredBaseURL || t('暂无')}
+                              </Text>
+                              <Text>
+                                {t('上次TCP测速')}:{' '}
+                                {formatUnixTime(baseURLProbeInfo.lastTime)}
+                              </Text>
+                              {baseURLProbeInfo.results.length > 0 ? (
+                                <div className='flex flex-col gap-1'>
+                                  {baseURLProbeInfo.results.map((item) => (
+                                    <div
+                                      key={item.url}
+                                      className='flex flex-wrap items-center gap-2'
+                                    >
+                                      <Text>{item.url}</Text>
+                                      <Tag
+                                        color={item.success ? 'green' : 'red'}
+                                        size='small'
+                                      >
+                                        {item.success
+                                          ? `${item.latency_ms || 0} ms`
+                                          : t('失败')}
+                                      </Tag>
+                                      {!item.success && item.error && (
+                                        <Text type='tertiary' size='small'>
+                                          {item.error}
+                                        </Text>
+                                      )}
+                                    </div>
+                                  ))}
+                                </div>
+                              ) : (
+                                <Text type='tertiary'>
+                                  {t('暂无TCP测速记录，保存后将自动生成')}
+                                </Text>
+                              )}
+                            </div>
+                          }
+                          className='!rounded-lg'
+                        />
                       )}
                     </div>
                   )}

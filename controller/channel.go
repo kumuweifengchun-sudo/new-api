@@ -434,9 +434,17 @@ func validateTwoFactorAuth(twoFA *model.TwoFA, code string) bool {
 
 // validateChannel 通用的渠道校验函数
 func validateChannel(channel *model.Channel, isAdd bool) error {
+	if channel == nil {
+		return fmt.Errorf("channel cannot be empty")
+	}
 	// 校验 channel settings
 	if err := channel.ValidateSettings(); err != nil {
 		return fmt.Errorf("渠道额外设置[channel setting] 格式错误：%s", err.Error())
+	}
+	if channel != nil && channel.BaseURL != nil && strings.TrimSpace(*channel.BaseURL) != "" {
+		if _, _, err := model.NormalizeBaseURLs(*channel.BaseURL); err != nil {
+			return err
+		}
 	}
 
 	// 如果是添加操作，检查 channel 和 key 是否为空
@@ -531,6 +539,47 @@ type AddChannelRequest struct {
 	Channel                   *model.Channel        `json:"channel"`
 }
 
+func normalizeChannelBaseURL(channel *model.Channel) error {
+	if channel == nil || channel.BaseURL == nil {
+		return nil
+	}
+	normalized, _, err := model.NormalizeBaseURLs(*channel.BaseURL)
+	if err != nil {
+		return err
+	}
+	channel.BaseURL = common.GetPointer(normalized)
+	return nil
+}
+
+func syncChannelBaseURLProbeSettings(channel *model.Channel) {
+	if channel == nil {
+		return
+	}
+
+	settings := channel.GetOtherSettings()
+	validURLs := channel.GetBaseURLs()
+	if len(validURLs) <= 1 {
+		settings.PreferredBaseURL = ""
+		settings.BaseURLProbeLastTime = 0
+		settings.BaseURLProbeResults = nil
+		channel.SetOtherSettings(settings)
+		return
+	}
+
+	settings.BaseURLProbeResults = model.FilterBaseURLProbeResults(settings.BaseURLProbeResults, validURLs)
+	preferredValid := false
+	for _, candidate := range validURLs {
+		if candidate == settings.PreferredBaseURL {
+			preferredValid = true
+			break
+		}
+	}
+	if !preferredValid {
+		settings.PreferredBaseURL = ""
+	}
+	channel.SetOtherSettings(settings)
+}
+
 func getVertexArrayKeys(keys string) ([]string, error) {
 	if keys == "" {
 		return nil, nil
@@ -570,6 +619,15 @@ func AddChannel(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+
+	if err = normalizeChannelBaseURL(addChannelRequest.Channel); err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	syncChannelBaseURLProbeSettings(addChannelRequest.Channel)
 
 	// 使用统一的校验函数
 	if err := validateChannel(addChannelRequest.Channel, true); err != nil {
@@ -650,12 +708,19 @@ func AddChannel(c *gin.Context) {
 		}
 		channels = append(channels, *localChannel)
 	}
-	err = model.BatchInsertChannels(channels)
+	createdChannels, err := model.BatchInsertChannels(channels)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
 	service.ResetProxyClientCache()
+	probeIDs := make([]int, 0, len(createdChannels))
+	for _, channel := range createdChannels {
+		if channel.HasMultipleBaseURLs() {
+			probeIDs = append(probeIDs, channel.Id)
+		}
+	}
+	service.TriggerChannelBaseURLProbe(probeIDs...)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
@@ -846,6 +911,15 @@ func UpdateChannel(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	baseURLWasProvided := channel.BaseURL != nil
+
+	if err = normalizeChannelBaseURL(&channel.Channel); err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
 
 	// 使用统一的校验函数
 	if err := validateChannel(&channel.Channel, false); err != nil {
@@ -867,11 +941,21 @@ func UpdateChannel(c *gin.Context) {
 
 	// Always copy the original ChannelInfo so that fields like IsMultiKey and MultiKeySize are retained.
 	channel.ChannelInfo = originChannel.ChannelInfo
+	if channel.Type == 0 {
+		channel.Type = originChannel.Type
+	}
+	if channel.BaseURL == nil {
+		channel.BaseURL = originChannel.BaseURL
+	}
+	if channel.OtherSettings == "" {
+		channel.OtherSettings = originChannel.OtherSettings
+	}
 
 	// If the request explicitly specifies a new MultiKeyMode, apply it on top of the original info.
 	if channel.MultiKeyMode != nil && *channel.MultiKeyMode != "" {
 		channel.ChannelInfo.MultiKeyMode = constant.MultiKeyMode(*channel.MultiKeyMode)
 	}
+	syncChannelBaseURLProbeSettings(&channel.Channel)
 
 	// 处理多key模式下的密钥追加/覆盖逻辑
 	if channel.KeyMode != nil && channel.ChannelInfo.IsMultiKey {
@@ -960,6 +1044,9 @@ func UpdateChannel(c *gin.Context) {
 	}
 	model.InitChannelCache()
 	service.ResetProxyClientCache()
+	if baseURLWasProvided && channel.HasMultipleBaseURLs() {
+		service.TriggerChannelBaseURLProbe(channel.Id)
+	}
 	channel.Key = ""
 	clearChannelInfo(&channel.Channel)
 	c.JSON(http.StatusOK, gin.H{
@@ -985,10 +1072,7 @@ func FetchModels(c *gin.Context) {
 		return
 	}
 
-	baseURL := req.BaseURL
-	if baseURL == "" {
-		baseURL = constant.ChannelBaseURLs[req.Type]
-	}
+	baseURL := model.ResolveBaseURLFromRaw(req.BaseURL, req.Type)
 
 	// remove line breaks and extra spaces.
 	key := strings.TrimSpace(req.Key)
@@ -1197,14 +1281,22 @@ func CopyChannel(c *gin.Context) {
 	}
 
 	// insert
-	if err := model.BatchInsertChannels([]model.Channel{clone}); err != nil {
+	createdChannels, err := model.BatchInsertChannels([]model.Channel{clone})
+	if err != nil {
 		common.SysError("failed to clone channel: " + err.Error())
 		c.JSON(http.StatusOK, gin.H{"success": false, "message": "复制渠道失败，请稍后重试"})
 		return
 	}
+	if len(createdChannels) > 0 && createdChannels[0].HasMultipleBaseURLs() {
+		service.TriggerChannelBaseURLProbe(createdChannels[0].Id)
+	}
 	model.InitChannelCache()
 	// success
-	c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": gin.H{"id": clone.Id}})
+	channelID := clone.Id
+	if len(createdChannels) > 0 {
+		channelID = createdChannels[0].Id
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": gin.H{"id": channelID}})
 }
 
 // MultiKeyManageRequest represents the request for multi-key management operations

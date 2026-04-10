@@ -1,10 +1,12 @@
 package channel
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"regexp"
 	"strings"
@@ -287,7 +289,85 @@ func applyHeaderOverrideToRequest(req *http.Request, headerOverride map[string]s
 	}
 }
 
-func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
+func getBaseURLCandidates(info *common.RelayInfo) []string {
+	if info == nil {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(info.ChannelBaseUrls)+1)
+	result := make([]string, 0, len(info.ChannelBaseUrls)+1)
+	appendCandidate := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+
+	appendCandidate(info.ChannelBaseUrl)
+	for _, candidate := range info.ChannelBaseUrls {
+		appendCandidate(candidate)
+	}
+	return result
+}
+
+func readReusableRequestBody(requestBody io.Reader) ([]byte, error) {
+	if requestBody == nil {
+		return nil, nil
+	}
+	return io.ReadAll(requestBody)
+}
+
+func isRetryableBaseURLStatus(statusCode int) bool {
+	return statusCode == http.StatusBadGateway ||
+		statusCode == http.StatusServiceUnavailable ||
+		statusCode == http.StatusGatewayTimeout
+}
+
+func isRetryableBaseURLError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	lower := strings.ToLower(err.Error())
+	retryableMarkers := []string{
+		"dial tcp",
+		"timeout",
+		"deadline exceeded",
+		"connection refused",
+		"connection reset",
+		"connection aborted",
+		"no such host",
+		"eof",
+		"broken pipe",
+		"tls handshake timeout",
+	}
+	for _, marker := range retryableMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func markSuccessfulBaseURL(info *common.RelayInfo, usedBaseURL string, attempt int) {
+	if info == nil || info.ChannelId == 0 || attempt <= 0 {
+		return
+	}
+	if err := service.SetPreferredChannelBaseURL(info.ChannelId, usedBaseURL); err != nil {
+		common2.SysLog(fmt.Sprintf("failed to persist preferred base_url: channel_id=%d err=%v", info.ChannelId, err))
+		return
+	}
+	service.TriggerChannelBaseURLProbe(info.ChannelId)
+}
+
+func doSingleAPIRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
 	fullRequestURL, err := a.GetRequestURL(info)
 	if err != nil {
 		return nil, fmt.Errorf("get request url failed: %w", err)
@@ -304,8 +384,6 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 	if err != nil {
 		return nil, fmt.Errorf("setup request header failed: %w", err)
 	}
-	// 在 SetupRequestHeader 之后应用 Header Override，确保用户设置优先级最高
-	// 这样可以覆盖默认的 Authorization header 设置
 	headerOverride, err := processHeaderOverride(info, c)
 	if err != nil {
 		return nil, err
@@ -318,7 +396,7 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 	return resp, nil
 }
 
-func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
+func doSingleFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
 	fullRequestURL, err := a.GetRequestURL(info)
 	if err != nil {
 		return nil, fmt.Errorf("get request url failed: %w", err)
@@ -330,15 +408,12 @@ func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBod
 	if err != nil {
 		return nil, fmt.Errorf("new request failed: %w", err)
 	}
-	// set form data
 	req.Header.Set("Content-Type", c.Request.Header.Get("Content-Type"))
 	headers := req.Header
 	err = a.SetupRequestHeader(c, &headers, info)
 	if err != nil {
 		return nil, fmt.Errorf("setup request header failed: %w", err)
 	}
-	// 在 SetupRequestHeader 之后应用 Header Override，确保用户设置优先级最高
-	// 这样可以覆盖默认的 Authorization header 设置
 	headerOverride, err := processHeaderOverride(info, c)
 	if err != nil {
 		return nil, err
@@ -351,34 +426,144 @@ func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBod
 	return resp, nil
 }
 
-func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*websocket.Conn, error) {
+func doSingleTaskAPIRequest(a TaskAdaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
+	fullRequestURL, err := a.BuildRequestURL(info)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(c.Request.Method, fullRequestURL, requestBody)
+	if err != nil {
+		return nil, fmt.Errorf("new request failed: %w", err)
+	}
+	err = a.BuildRequestHeader(c, req, info)
+	if err != nil {
+		return nil, fmt.Errorf("setup request header failed: %w", err)
+	}
+	resp, err := doRequest(c, req, info)
+	if err != nil {
+		return nil, fmt.Errorf("do request failed: %w", err)
+	}
+	return resp, nil
+}
+
+func doSingleWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo) (*websocket.Conn, *http.Response, error) {
 	fullRequestURL, err := a.GetRequestURL(info)
 	if err != nil {
-		return nil, fmt.Errorf("get request url failed: %w", err)
+		return nil, nil, fmt.Errorf("get request url failed: %w", err)
 	}
 	targetHeader := http.Header{}
 	err = a.SetupRequestHeader(c, &targetHeader, info)
 	if err != nil {
-		return nil, fmt.Errorf("setup request header failed: %w", err)
+		return nil, nil, fmt.Errorf("setup request header failed: %w", err)
 	}
-	// 在 SetupRequestHeader 之后应用 Header Override，确保用户设置优先级最高
-	// 这样可以覆盖默认的 Authorization header 设置
 	headerOverride, err := processHeaderOverride(info, c)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	for key, value := range headerOverride {
 		targetHeader.Set(key, value)
 	}
 	targetHeader.Set("Content-Type", c.Request.Header.Get("Content-Type"))
-	targetConn, _, err := websocket.DefaultDialer.Dial(fullRequestURL, targetHeader)
+	targetConn, resp, err := websocket.DefaultDialer.Dial(fullRequestURL, targetHeader)
 	if err != nil {
-		return nil, fmt.Errorf("dial failed to %s: %w", fullRequestURL, err)
+		return nil, resp, fmt.Errorf("dial failed to %s: %w", fullRequestURL, err)
 	}
-	// send request body
-	//all, err := io.ReadAll(requestBody)
-	//err = service.WssString(c, targetConn, string(all))
-	return targetConn, nil
+	return targetConn, nil, nil
+}
+
+func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
+	candidates := getBaseURLCandidates(info)
+	if len(candidates) <= 1 {
+		return doSingleAPIRequest(a, c, info, requestBody)
+	}
+
+	bodyBytes, err := readReusableRequestBody(requestBody)
+	if err != nil {
+		return nil, fmt.Errorf("read request body failed: %w", err)
+	}
+
+	for idx, baseURL := range candidates {
+		info.ChannelBaseUrl = baseURL
+		var bodyReader io.Reader
+		if bodyBytes != nil {
+			bodyReader = bytes.NewReader(bodyBytes)
+		}
+		resp, reqErr := doSingleAPIRequest(a, c, info, bodyReader)
+		if reqErr != nil {
+			if idx < len(candidates)-1 && isRetryableBaseURLError(reqErr) {
+				continue
+			}
+			return nil, reqErr
+		}
+		if idx < len(candidates)-1 && isRetryableBaseURLStatus(resp.StatusCode) {
+			service.CloseResponseBodyGracefully(resp)
+			continue
+		}
+		markSuccessfulBaseURL(info, baseURL, idx)
+		return resp, nil
+	}
+	return nil, errors.New("all base_url attempts failed")
+}
+
+func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
+	candidates := getBaseURLCandidates(info)
+	if len(candidates) <= 1 {
+		return doSingleFormRequest(a, c, info, requestBody)
+	}
+
+	bodyBytes, err := readReusableRequestBody(requestBody)
+	if err != nil {
+		return nil, fmt.Errorf("read request body failed: %w", err)
+	}
+
+	for idx, baseURL := range candidates {
+		info.ChannelBaseUrl = baseURL
+		var bodyReader io.Reader
+		if bodyBytes != nil {
+			bodyReader = bytes.NewReader(bodyBytes)
+		}
+		resp, reqErr := doSingleFormRequest(a, c, info, bodyReader)
+		if reqErr != nil {
+			if idx < len(candidates)-1 && isRetryableBaseURLError(reqErr) {
+				continue
+			}
+			return nil, reqErr
+		}
+		if idx < len(candidates)-1 && isRetryableBaseURLStatus(resp.StatusCode) {
+			service.CloseResponseBodyGracefully(resp)
+			continue
+		}
+		markSuccessfulBaseURL(info, baseURL, idx)
+		return resp, nil
+	}
+	return nil, errors.New("all base_url attempts failed")
+}
+
+func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*websocket.Conn, error) {
+	candidates := getBaseURLCandidates(info)
+	if len(candidates) == 0 {
+		candidates = []string{info.ChannelBaseUrl}
+	}
+
+	var lastErr error
+	for idx, baseURL := range candidates {
+		info.ChannelBaseUrl = baseURL
+		targetConn, resp, err := doSingleWssRequest(a, c, info)
+		if err != nil {
+			lastErr = err
+			if resp != nil && idx < len(candidates)-1 && isRetryableBaseURLStatus(resp.StatusCode) {
+				service.CloseResponseBodyGracefully(resp)
+				continue
+			}
+			if idx < len(candidates)-1 && isRetryableBaseURLError(err) {
+				continue
+			}
+			return nil, err
+		}
+		markSuccessfulBaseURL(info, baseURL, idx)
+		return targetConn, nil
+	}
+	return nil, lastErr
 }
 
 func startPingKeepAlive(c *gin.Context, pingInterval time.Duration) context.CancelFunc {
@@ -530,25 +715,35 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 }
 
 func DoTaskApiRequest(a TaskAdaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
-	fullRequestURL, err := a.BuildRequestURL(info)
-	if err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequest(c.Request.Method, fullRequestURL, requestBody)
-	if err != nil {
-		return nil, fmt.Errorf("new request failed: %w", err)
-	}
-	req.GetBody = func() (io.ReadCloser, error) {
-		return io.NopCloser(requestBody), nil
+	candidates := getBaseURLCandidates(info)
+	if len(candidates) <= 1 {
+		return doSingleTaskAPIRequest(a, c, info, requestBody)
 	}
 
-	err = a.BuildRequestHeader(c, req, info)
+	bodyBytes, err := readReusableRequestBody(requestBody)
 	if err != nil {
-		return nil, fmt.Errorf("setup request header failed: %w", err)
+		return nil, fmt.Errorf("read request body failed: %w", err)
 	}
-	resp, err := doRequest(c, req, info)
-	if err != nil {
-		return nil, fmt.Errorf("do request failed: %w", err)
+
+	for idx, baseURL := range candidates {
+		info.ChannelBaseUrl = baseURL
+		var bodyReader io.Reader
+		if bodyBytes != nil {
+			bodyReader = bytes.NewReader(bodyBytes)
+		}
+		resp, reqErr := doSingleTaskAPIRequest(a, c, info, bodyReader)
+		if reqErr != nil {
+			if idx < len(candidates)-1 && isRetryableBaseURLError(reqErr) {
+				continue
+			}
+			return nil, reqErr
+		}
+		if idx < len(candidates)-1 && isRetryableBaseURLStatus(resp.StatusCode) {
+			service.CloseResponseBodyGracefully(resp)
+			continue
+		}
+		markSuccessfulBaseURL(info, baseURL, idx)
+		return resp, nil
 	}
-	return resp, nil
+	return nil, errors.New("all base_url attempts failed")
 }

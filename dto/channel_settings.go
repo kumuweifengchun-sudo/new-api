@@ -23,6 +23,14 @@ const (
 	AwsKeyTypeApiKey AwsKeyType = "api_key"
 )
 
+type BaseURLProbeResult struct {
+	URL       string `json:"url"`
+	LatencyMs int64  `json:"latency_ms,omitempty"`
+	Success   bool   `json:"success"`
+	Error     string `json:"error,omitempty"`
+	CheckedAt int64  `json:"checked_at,omitempty"`
+}
+
 type ChannelOtherSettings struct {
 	AzureResponsesVersion                 string        `json:"azure_responses_version,omitempty"`
 	VertexKeyType                         VertexKeyType `json:"vertex_key_type,omitempty"` // "json" or "api_key"
@@ -40,6 +48,9 @@ type ChannelOtherSettings struct {
 	UpstreamModelUpdateLastDetectedModels []string      `json:"upstream_model_update_last_detected_models,omitempty"` // 上次检测到的可加入模型
 	UpstreamModelUpdateLastRemovedModels  []string      `json:"upstream_model_update_last_removed_models,omitempty"`  // 上次检测到的可删除模型
 	UpstreamModelUpdateIgnoredModels      []string      `json:"upstream_model_update_ignored_models,omitempty"`       // 手动忽略的模型
+	PreferredBaseURL                      string               `json:"preferred_base_url,omitempty"`
+	BaseURLProbeLastTime                  int64                `json:"base_url_probe_last_time,omitempty"`
+	BaseURLProbeResults                   []BaseURLProbeResult `json:"base_url_probe_results,omitempty"`
 }
 
 func (s *ChannelOtherSettings) IsOpenRouterEnterprise() bool {
