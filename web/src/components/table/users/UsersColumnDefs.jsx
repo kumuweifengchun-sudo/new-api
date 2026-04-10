@@ -193,6 +193,14 @@ const renderInviteInfo = (text, record, t) => {
   );
 };
 
+const renderUserLimit = (value, fallbackText) => {
+  return (
+    <Tag color='white' shape='circle'>
+      {value == null ? fallbackText : value}
+    </Tag>
+  );
+};
+
 /**
  * Render operations column
  */
@@ -344,6 +352,16 @@ export const getUsersColumns = ({
       render: (text, record, index) => {
         return <div>{renderRole(text, t)}</div>;
       },
+    },
+    {
+      title: t('用户令牌上限'),
+      dataIndex: 'max_tokens_override',
+      render: (value) => renderUserLimit(value, t('继承全局')),
+    },
+    {
+      title: t('每令牌IP上限'),
+      dataIndex: 'max_ips_per_token',
+      render: (value) => renderUserLimit(value, t('不限制')),
     },
     {
       title: t('邀请信息'),

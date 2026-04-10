@@ -1,8 +1,10 @@
 package controller
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
@@ -77,6 +79,10 @@ func AddRedemption(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgRedemptionCountMax)
 		return
 	}
+	if err = validateRedemptionReward(&redemption); err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	if valid, msg := validateExpiredTime(c, redemption.ExpiredTime); !valid {
 		c.JSON(http.StatusOK, gin.H{"success": false, "message": msg})
 		return
@@ -85,12 +91,14 @@ func AddRedemption(c *gin.Context) {
 	for i := 0; i < redemption.Count; i++ {
 		key := common.GetUUID()
 		cleanRedemption := model.Redemption{
-			UserId:      c.GetInt("id"),
-			Name:        redemption.Name,
-			Key:         key,
-			CreatedTime: common.GetTimestamp(),
-			Quota:       redemption.Quota,
-			ExpiredTime: redemption.ExpiredTime,
+			UserId:             c.GetInt("id"),
+			Name:               redemption.Name,
+			Key:                key,
+			CreatedTime:        common.GetTimestamp(),
+			RewardType:         redemption.RewardType,
+			Quota:              redemption.Quota,
+			SubscriptionPlanId: redemption.SubscriptionPlanId,
+			ExpiredTime:        redemption.ExpiredTime,
 		}
 		err = cleanRedemption.Insert()
 		if err != nil {
@@ -140,13 +148,19 @@ func UpdateRedemption(c *gin.Context) {
 		return
 	}
 	if statusOnly == "" {
+		if err = validateRedemptionReward(&redemption); err != nil {
+			common.ApiError(c, err)
+			return
+		}
 		if valid, msg := validateExpiredTime(c, redemption.ExpiredTime); !valid {
 			c.JSON(http.StatusOK, gin.H{"success": false, "message": msg})
 			return
 		}
 		// If you add more fields, please also update redemption.Update()
 		cleanRedemption.Name = redemption.Name
+		cleanRedemption.RewardType = redemption.RewardType
 		cleanRedemption.Quota = redemption.Quota
+		cleanRedemption.SubscriptionPlanId = redemption.SubscriptionPlanId
 		cleanRedemption.ExpiredTime = redemption.ExpiredTime
 	}
 	if statusOnly != "" {
@@ -184,4 +198,37 @@ func validateExpiredTime(c *gin.Context, expired int64) (bool, string) {
 		return false, i18n.T(c, i18n.MsgRedemptionExpireTimeInvalid)
 	}
 	return true, ""
+}
+
+func validateRedemptionReward(redemption *model.Redemption) error {
+	if redemption == nil {
+		return errors.New("兑换码参数无效")
+	}
+	rewardType := model.NormalizeRedemptionRewardType(redemption.RewardType)
+	if rewardType == "" {
+		return errors.New("无效的兑换奖励类型")
+	}
+	redemption.RewardType = rewardType
+	switch rewardType {
+	case model.RedemptionRewardTypeQuota:
+		redemption.SubscriptionPlanId = 0
+		if redemption.Quota <= 0 {
+			return errors.New("额度必须大于0")
+		}
+	case model.RedemptionRewardTypeSubscription:
+		redemption.Quota = 0
+		if redemption.SubscriptionPlanId <= 0 {
+			return errors.New("请选择订阅套餐")
+		}
+		plan, err := model.GetSubscriptionPlanById(redemption.SubscriptionPlanId)
+		if err != nil {
+			return errors.New("订阅套餐不存在")
+		}
+		if plan == nil || strings.TrimSpace(plan.Title) == "" {
+			return errors.New("订阅套餐不存在")
+		}
+	default:
+		return errors.New("无效的兑换奖励类型")
+	}
+	return nil
 }

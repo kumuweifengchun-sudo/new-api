@@ -12,6 +12,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
@@ -55,8 +56,8 @@ func setupTokenControllerTestDB(t *testing.T) *gorm.DB {
 	model.DB = db
 	model.LOG_DB = db
 
-	if err := db.AutoMigrate(&model.Token{}); err != nil {
-		t.Fatalf("failed to migrate token table: %v", err)
+	if err := db.AutoMigrate(&model.User{}, &model.Token{}); err != nil {
+		t.Fatalf("failed to migrate tables: %v", err)
 	}
 
 	t.Cleanup(func() {
@@ -88,6 +89,25 @@ func seedToken(t *testing.T, db *gorm.DB, userID int, name string, rawKey string
 		t.Fatalf("failed to create token: %v", err)
 	}
 	return token
+}
+
+func seedUser(t *testing.T, db *gorm.DB, userID int, maxTokensOverride *int) *model.User {
+	t.Helper()
+
+	user := &model.User{
+		Id:                userID,
+		Username:          fmt.Sprintf("user-%d", userID),
+		Password:          "hashed-password",
+		DisplayName:       fmt.Sprintf("User %d", userID),
+		Role:              common.RoleCommonUser,
+		Status:            common.UserStatusEnabled,
+		Group:             "default",
+		MaxTokensOverride: maxTokensOverride,
+	}
+	if err := db.Create(user).Error; err != nil {
+		t.Fatalf("failed to create user: %v", err)
+	}
+	return user
 }
 
 func newAuthenticatedContext(t *testing.T, method string, target string, body any, userID int) (*gin.Context, *httptest.ResponseRecorder) {
@@ -237,6 +257,46 @@ func TestUpdateTokenMasksKeyInResponse(t *testing.T) {
 	}
 	if strings.Contains(recorder.Body.String(), token.Key) {
 		t.Fatalf("update response leaked raw token key: %s", recorder.Body.String())
+	}
+}
+
+func TestAddTokenHonorsUserSpecificTokenLimit(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	oldMaxTokens := operation_setting.GetTokenSetting().MaxUserTokens
+	operation_setting.GetTokenSetting().MaxUserTokens = 100
+	t.Cleanup(func() {
+		operation_setting.GetTokenSetting().MaxUserTokens = oldMaxTokens
+	})
+
+	limit := 1
+	seedUser(t, db, 1, &limit)
+
+	body := map[string]any{
+		"name":                 "limited-token",
+		"expired_time":         -1,
+		"remain_quota":         100,
+		"unlimited_quota":      true,
+		"model_limits_enabled": false,
+		"model_limits":         "",
+		"group":                "default",
+		"cross_group_retry":    false,
+	}
+
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/", body, 1)
+	AddToken(ctx)
+	firstResponse := decodeAPIResponse(t, recorder)
+	if !firstResponse.Success {
+		t.Fatalf("expected first token creation to succeed, got message: %s", firstResponse.Message)
+	}
+
+	ctx, recorder = newAuthenticatedContext(t, http.MethodPost, "/api/token/", body, 1)
+	AddToken(ctx)
+	secondResponse := decodeAPIResponse(t, recorder)
+	if secondResponse.Success {
+		t.Fatalf("expected second token creation to fail due to user-specific limit")
+	}
+	if !strings.Contains(secondResponse.Message, "已达到最大令牌数量限制 (1)") {
+		t.Fatalf("expected user-specific limit message, got %q", secondResponse.Message)
 	}
 }
 

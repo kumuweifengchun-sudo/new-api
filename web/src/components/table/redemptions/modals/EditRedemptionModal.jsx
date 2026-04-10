@@ -60,7 +60,9 @@ const EditRedemptionModal = (props) => {
 
   const getInitValues = () => ({
     name: '',
+    reward_type: 'quota',
     quota: 100000,
+    subscription_plan_id: undefined,
     count: 1,
     expired_time: null,
   });
@@ -74,6 +76,10 @@ const EditRedemptionModal = (props) => {
     let res = await API.get(`/api/redemption/${props.editingRedemption.id}`);
     const { success, message, data } = res.data;
     if (success) {
+      data.reward_type = data.reward_type || 'quota';
+      if (data.subscription_plan_id === 0) {
+        data.subscription_plan_id = undefined;
+      }
       if (data.expired_time === 0) {
         data.expired_time = null;
       } else {
@@ -98,13 +104,28 @@ const EditRedemptionModal = (props) => {
 
   const submit = async (values) => {
     let name = values.name;
-    if (!isEdit && (!name || name === '')) {
-      name = renderQuota(values.quota);
-    }
     setLoading(true);
     let localInputs = { ...values };
+    localInputs.reward_type = values.reward_type || 'quota';
     localInputs.count = parseInt(localInputs.count) || 0;
-    localInputs.quota = parseInt(localInputs.quota) || 0;
+    localInputs.subscription_plan_id =
+      parseInt(localInputs.subscription_plan_id, 10) || 0;
+    if (localInputs.reward_type === 'quota') {
+      localInputs.quota = parseInt(localInputs.quota, 10) || 0;
+      localInputs.subscription_plan_id = 0;
+    } else {
+      localInputs.quota = 0;
+    }
+    if (!isEdit && (!name || name === '')) {
+      if (localInputs.reward_type === 'subscription') {
+        const matchedPlan = (props.subscriptionPlans || []).find(
+          (item) => item?.plan?.id === localInputs.subscription_plan_id,
+        );
+        name = (matchedPlan?.plan?.title || t('订阅套餐')).slice(0, 20);
+      } else {
+        name = renderQuota(localInputs.quota);
+      }
+    }
     localInputs.name = name;
     if (!localInputs.expired_time) {
       localInputs.expired_time = 0;
@@ -265,7 +286,7 @@ const EditRedemptionModal = (props) => {
                 </Card>
 
                 <Card className='!rounded-2xl shadow-sm border-0'>
-                  {/* Header: Quota Settings */}
+                  {/* Header: Reward Settings */}
                   <div className='flex items-center mb-2'>
                     <Avatar
                       size='small'
@@ -276,46 +297,80 @@ const EditRedemptionModal = (props) => {
                     </Avatar>
                     <div>
                       <Text className='text-lg font-medium'>
-                        {t('额度设置')}
+                        {t('奖励设置')}
                       </Text>
                       <div className='text-xs text-gray-600'>
-                        {t('设置兑换码的额度和数量')}
+                        {t('设置兑换码的奖励和数量')}
                       </div>
                     </div>
                   </div>
 
                   <Row gutter={12}>
-                    <Col span={12}>
-                      <Form.AutoComplete
-                        field='quota'
-                        label={t('额度')}
-                        placeholder={t('请输入额度')}
-                        style={{ width: '100%' }}
-                        type='number'
+                    <Col span={24}>
+                      <Form.Select
+                        field='reward_type'
+                        label={t('奖励类型')}
+                        optionList={[
+                          { label: t('额度'), value: 'quota' },
+                          { label: t('订阅套餐'), value: 'subscription' },
+                        ]}
                         rules={[
-                          { required: true, message: t('请输入额度') },
-                          {
-                            validator: (rule, v) => {
-                              const num = parseInt(v, 10);
-                              return num > 0
-                                ? Promise.resolve()
-                                : Promise.reject(t('额度必须大于0'));
-                            },
-                          },
+                          { required: true, message: t('请选择奖励类型') },
                         ]}
-                        extraText={renderQuotaWithPrompt(
-                          Number(values.quota) || 0,
-                        )}
-                        data={[
-                          { value: 500000, label: '1$' },
-                          { value: 5000000, label: '10$' },
-                          { value: 25000000, label: '50$' },
-                          { value: 50000000, label: '100$' },
-                          { value: 250000000, label: '500$' },
-                          { value: 500000000, label: '1000$' },
-                        ]}
-                        showClear
+                        style={{ width: '100%' }}
                       />
+                    </Col>
+                    <Col span={12}>
+                      {values.reward_type === 'subscription' ? (
+                        <Form.Select
+                          field='subscription_plan_id'
+                          label={t('订阅套餐')}
+                          placeholder={t('选择订阅套餐')}
+                          loading={props.subscriptionLoading}
+                          optionList={(props.subscriptionPlans || []).map(
+                            (item) => ({
+                              label: item?.plan?.title || `#${item?.plan?.id}`,
+                              value: item?.plan?.id,
+                            }),
+                          )}
+                          rules={[
+                            { required: true, message: t('请选择订阅套餐') },
+                          ]}
+                          style={{ width: '100%' }}
+                          filter
+                        />
+                      ) : (
+                        <Form.AutoComplete
+                          field='quota'
+                          label={t('额度')}
+                          placeholder={t('请输入额度')}
+                          style={{ width: '100%' }}
+                          type='number'
+                          rules={[
+                            { required: true, message: t('请输入额度') },
+                            {
+                              validator: (rule, v) => {
+                                const num = parseInt(v, 10);
+                                return num > 0
+                                  ? Promise.resolve()
+                                  : Promise.reject(t('额度必须大于0'));
+                              },
+                            },
+                          ]}
+                          extraText={renderQuotaWithPrompt(
+                            Number(values.quota) || 0,
+                          )}
+                          data={[
+                            { value: 500000, label: '1$' },
+                            { value: 5000000, label: '10$' },
+                            { value: 25000000, label: '50$' },
+                            { value: 50000000, label: '100$' },
+                            { value: 250000000, label: '500$' },
+                            { value: 500000000, label: '1000$' },
+                          ]}
+                          showClear
+                        />
+                      )}
                     </Col>
                     {!isEdit && (
                       <Col span={12}>

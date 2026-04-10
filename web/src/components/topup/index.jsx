@@ -28,6 +28,7 @@ import {
   renderQuotaWithAmount,
   copy,
   getQuotaPerUnit,
+  timestamp2string,
 } from '../../helpers';
 import { Modal, Toast } from '@douyinfe/semi-ui';
 import { useTranslation } from 'react-i18next';
@@ -125,18 +126,40 @@ const TopUp = () => {
       const { success, message, data } = res.data;
       if (success) {
         showSuccess(t('兑换成功！'));
-        Modal.success({
-          title: t('兑换成功！'),
-          content: t('成功兑换额度：') + renderQuota(data),
-          centered: true,
-        });
-        if (userState.user) {
-          const updatedUser = {
-            ...userState.user,
-            quota: userState.user.quota + data,
-          };
-          userDispatch({ type: 'login', payload: updatedUser });
+        const responseData =
+          typeof data === 'number'
+            ? { reward_type: 'quota', quota: data }
+            : data || {};
+        const rewardType = responseData.reward_type || 'quota';
+        if (rewardType === 'subscription' && responseData.subscription) {
+          const subscription = responseData.subscription;
+          Modal.success({
+            title: t('兑换成功！'),
+            content: (
+              <div>
+                <div>
+                  {t('成功兑换订阅套餐：')}
+                  {subscription.plan_title}
+                </div>
+                {subscription.end_time ? (
+                  <div>
+                    {t('有效期至')} {timestamp2string(subscription.end_time)}
+                  </div>
+                ) : null}
+              </div>
+            ),
+            centered: true,
+          });
+        } else {
+          Modal.success({
+            title: t('兑换成功！'),
+            content:
+              t('成功兑换额度：') + renderQuota(responseData.quota || 0),
+            centered: true,
+          });
         }
+        await getUserQuota();
+        await getSubscriptionSelf();
         setRedemptionCode('');
       } else {
         showError(message);

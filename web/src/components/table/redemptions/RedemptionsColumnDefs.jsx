@@ -45,6 +45,28 @@ const renderTimestamp = (timestamp) => {
   return <>{timestamp2string(timestamp)}</>;
 };
 
+const getRewardDisplay = (record, subscriptionPlans, t) => {
+  const rewardType = record?.reward_type || 'quota';
+  if (rewardType === 'subscription') {
+    const matchedPlan = (subscriptionPlans || []).find(
+      (item) => item?.plan?.id === record?.subscription_plan_id,
+    );
+    const title =
+      matchedPlan?.plan?.title ||
+      (record?.subscription_plan_id ? `#${record.subscription_plan_id}` : '-');
+    return (
+      <Tag color='blue' shape='circle'>
+        {t('订阅套餐')}: {title}
+      </Tag>
+    );
+  }
+  return (
+    <Tag color='grey' shape='circle'>
+      {renderQuota(parseInt(record?.quota || 0))}
+    </Tag>
+  );
+};
+
 /**
  * Render redemption code status
  */
@@ -85,6 +107,7 @@ export const getRedemptionsColumns = ({
   refresh,
   redemptions,
   activePage,
+  subscriptionPlans,
   showDeleteRedemptionModal,
 }) => {
   return [
@@ -105,16 +128,10 @@ export const getRedemptionsColumns = ({
       },
     },
     {
-      title: t('额度'),
-      dataIndex: 'quota',
-      render: (text) => {
-        return (
-          <div>
-            <Tag color='grey' shape='circle'>
-              {renderQuota(parseInt(text))}
-            </Tag>
-          </div>
-        );
+      title: t('奖励'),
+      key: 'reward',
+      render: (_, record) => {
+        return <div>{getRewardDisplay(record, subscriptionPlans, t)}</div>;
       },
     },
     {

@@ -68,6 +68,8 @@ const RedemptionsPage = () => {
         editingRedemption={editingRedemption}
         visiable={showEdit}
         handleClose={closeEdit}
+        subscriptionPlans={redemptionsData.subscriptionPlans}
+        subscriptionLoading={redemptionsData.subscriptionLoading}
       />
 
       <CardPro

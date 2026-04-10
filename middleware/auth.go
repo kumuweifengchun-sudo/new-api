@@ -339,6 +339,23 @@ func TokenAuth() func(c *gin.Context) {
 			abortWithOpenAiMessage(c, http.StatusForbidden, "用户已被封禁")
 			return
 		}
+		if maxIPs, ok := userCache.GetMaxIpsPerToken(); ok {
+			clientIp := c.ClientIP()
+			ip := net.ParseIP(clientIp)
+			if ip == nil {
+				abortWithOpenAiMessage(c, http.StatusForbidden, "无法解析客户端 IP 地址")
+				return
+			}
+			allowed, err := token.RegisterUsedIP(ip.String(), maxIPs)
+			if err != nil {
+				abortWithOpenAiMessage(c, http.StatusInternalServerError, err.Error())
+				return
+			}
+			if !allowed {
+				abortWithOpenAiMessage(c, http.StatusForbidden, fmt.Sprintf("该令牌最多允许 %d 个 IP 使用，当前 IP 未被授权", maxIPs), types.ErrorCodeAccessDenied)
+				return
+			}
+		}
 
 		userCache.WriteContext(c)
 

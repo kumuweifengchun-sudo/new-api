@@ -39,6 +39,8 @@ export const useRedemptionsData = () => {
   const [pageSize, setPageSize] = useState(ITEMS_PER_PAGE);
   const [tokenCount, setTokenCount] = useState(0);
   const [selectedKeys, setSelectedKeys] = useState([]);
+  const [subscriptionPlans, setSubscriptionPlans] = useState([]);
+  const [subscriptionLoading, setSubscriptionLoading] = useState(false);
 
   // Edit state
   const [editingRedemption, setEditingRedemption] = useState({
@@ -68,6 +70,21 @@ export const useRedemptionsData = () => {
   // Set redemption data format
   const setRedemptionFormat = (redemptions) => {
     setRedemptions(redemptions);
+  };
+
+  const loadSubscriptionPlans = async () => {
+    setSubscriptionLoading(true);
+    try {
+      const res = await API.get('/api/subscription/admin/plans');
+      if (res.data?.success) {
+        setSubscriptionPlans(res.data.data || []);
+      } else {
+        showError(res.data?.message);
+      }
+    } catch (error) {
+      showError(error.message);
+    }
+    setSubscriptionLoading(false);
   };
 
   // Load redemption list
@@ -303,6 +320,14 @@ export const useRedemptionsData = () => {
       });
   }, [pageSize]);
 
+  useEffect(() => {
+    loadSubscriptionPlans()
+      .then()
+      .catch((reason) => {
+        showError(reason);
+      });
+  }, []);
+
   return {
     // Data state
     redemptions,
@@ -312,6 +337,8 @@ export const useRedemptionsData = () => {
     pageSize,
     tokenCount,
     selectedKeys,
+    subscriptionPlans,
+    subscriptionLoading,
 
     // Edit state
     editingRedemption,
@@ -327,6 +354,7 @@ export const useRedemptionsData = () => {
 
     // Data operations
     loadRedemptions,
+    loadSubscriptionPlans,
     searchRedemptions,
     manageRedemption,
     refresh,

@@ -32,6 +32,7 @@ import {
   Form,
   Row,
   Col,
+  InputNumber,
 } from '@douyinfe/semi-ui';
 import { IconSave, IconClose, IconUserAdd } from '@douyinfe/semi-icons';
 import { useTranslation } from 'react-i18next';
@@ -172,6 +173,55 @@ const AddUserModal = (props) => {
                       placeholder={t('请输入备注（仅管理员可见）')}
                       showClear
                     />
+                  </Col>
+                </Row>
+              </Card>
+
+              <Card className='!rounded-2xl shadow-sm border-0 mt-3'>
+                <div className='flex items-center mb-2'>
+                  <Avatar size='small' color='green' className='mr-2 shadow-md'>
+                    <IconUserAdd size={16} />
+                  </Avatar>
+                  <div>
+                    <Text className='text-lg font-medium'>{t('令牌限制')}</Text>
+                    <div className='text-xs text-gray-600'>
+                      {t('为该用户设置专属令牌和 IP 限制')}
+                    </div>
+                  </div>
+                </div>
+
+                <Row gutter={12}>
+                  <Col span={24}>
+                    <Form.Slot
+                      label={t('最多可创建令牌数')}
+                      extraText={t('留空则继承站点全局上限')}
+                    >
+                      <InputNumber
+                        value={formApiRef.current?.getValue('max_tokens_override')}
+                        min={0}
+                        placeholder={t('设置为 0 表示该用户不能创建任何令牌')}
+                        onChange={(value) =>
+                          formApiRef.current?.setValue('max_tokens_override', value)
+                        }
+                        style={{ width: '100%' }}
+                      />
+                    </Form.Slot>
+                  </Col>
+                  <Col span={24}>
+                    <Form.Slot
+                      label={t('每个令牌最大使用 IP 数')}
+                      extraText={t('留空则不限制该用户令牌可使用的 IP 数')}
+                    >
+                      <InputNumber
+                        value={formApiRef.current?.getValue('max_ips_per_token')}
+                        min={1}
+                        placeholder={t('请输入每个令牌最大使用 IP 数')}
+                        onChange={(value) =>
+                          formApiRef.current?.setValue('max_ips_per_token', value)
+                        }
+                        style={{ width: '100%' }}
+                      />
+                    </Form.Slot>
                   </Col>
                 </Row>
               </Card>

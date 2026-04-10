@@ -29,6 +29,19 @@ type LoginRequest struct {
 	Password string `json:"password"`
 }
 
+func validateUserTokenLimits(user *model.User) error {
+	if user == nil {
+		return nil
+	}
+	if user.MaxTokensOverride != nil && *user.MaxTokensOverride < 0 {
+		return errors.New("用户最多可创建令牌数不能小于 0")
+	}
+	if user.MaxIpsPerToken != nil && *user.MaxIpsPerToken < 1 {
+		return errors.New("每个令牌最大使用 IP 数不能小于 1")
+	}
+	return nil
+}
+
 func Login(c *gin.Context) {
 	if !common.PasswordLoginEnabled {
 		common.ApiErrorI18n(c, i18n.MsgUserPasswordLoginDisabled)
@@ -564,6 +577,10 @@ func UpdateUser(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgUserCannotCreateHigherLevel)
 		return
 	}
+	if err := validateUserTokenLimits(&updatedUser); err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	if updatedUser.Password == "$I_LOVE_U" {
 		updatedUser.Password = "" // rollback to what it should be
 	}
@@ -819,12 +836,19 @@ func CreateUser(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgUserCannotCreateHigherLevel)
 		return
 	}
+	if err := validateUserTokenLimits(&user); err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	// Even for admin users, we cannot fully trust them!
 	cleanUser := model.User{
-		Username:    user.Username,
-		Password:    user.Password,
-		DisplayName: user.DisplayName,
-		Role:        user.Role, // 保持管理员设置的角色
+		Username:          user.Username,
+		Password:          user.Password,
+		DisplayName:       user.DisplayName,
+		Role:              user.Role, // 保持管理员设置的角色
+		Remark:            user.Remark,
+		MaxTokensOverride: user.MaxTokensOverride,
+		MaxIpsPerToken:    user.MaxIpsPerToken,
 	}
 	if err := cleanUser.Insert(0); err != nil {
 		common.ApiError(c, err)
@@ -1025,7 +1049,7 @@ func TopUp(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	quota, err := model.Redeem(req.Key, id)
+	result, err := model.Redeem(req.Key, id)
 	if err != nil {
 		if errors.Is(err, model.ErrRedeemFailed) {
 			common.ApiErrorI18n(c, i18n.MsgRedeemFailed)
@@ -1037,7 +1061,7 @@ func TopUp(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
-		"data":    quota,
+		"data":    result,
 	})
 }
 

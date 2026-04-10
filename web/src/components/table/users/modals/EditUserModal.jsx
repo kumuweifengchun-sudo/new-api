@@ -323,6 +323,46 @@ const EditUserModal = (props) => {
                           />
                         </Form.Slot>
                       </Col>
+
+                      <Col span={24}>
+                        <Form.Slot
+                          label={t('最多可创建令牌数')}
+                          extraText={t('留空则继承站点全局上限')}
+                        >
+                          <InputNumber
+                            value={values.max_tokens_override}
+                            min={0}
+                            placeholder={t('设置为 0 表示该用户不能创建任何令牌')}
+                            onChange={(value) =>
+                              formApiRef.current?.setValue(
+                                'max_tokens_override',
+                                value,
+                              )
+                            }
+                            style={{ width: '100%' }}
+                          />
+                        </Form.Slot>
+                      </Col>
+
+                      <Col span={24}>
+                        <Form.Slot
+                          label={t('每个令牌最大使用 IP 数')}
+                          extraText={t('留空则不限制该用户令牌可使用的 IP 数')}
+                        >
+                          <InputNumber
+                            value={values.max_ips_per_token}
+                            min={1}
+                            placeholder={t('请输入每个令牌最大使用 IP 数')}
+                            onChange={(value) =>
+                              formApiRef.current?.setValue(
+                                'max_ips_per_token',
+                                value,
+                              )
+                            }
+                            style={{ width: '100%' }}
+                          />
+                        </Form.Slot>
+                      </Col>
                     </Row>
                   </Card>
                 )}

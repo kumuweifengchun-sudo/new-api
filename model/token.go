@@ -25,6 +25,7 @@ type Token struct {
 	ModelLimitsEnabled bool           `json:"model_limits_enabled"`
 	ModelLimits        string         `json:"model_limits" gorm:"type:text"`
 	AllowIps           *string        `json:"allow_ips" gorm:"default:''"`
+	UsedIps            *string        `json:"used_ips" gorm:"type:text"`
 	UsedQuota          int            `json:"used_quota" gorm:"default:0"` // used quota
 	Group              string         `json:"group" gorm:"default:''"`
 	CrossGroupRetry    bool           `json:"cross_group_retry"` // 跨分组重试，仅auto分组有效
@@ -57,25 +58,117 @@ func (token *Token) GetMaskedKey() string {
 }
 
 func (token *Token) GetIpLimits() []string {
-	// delete empty spaces
-	//split with \n
-	ipLimits := make([]string, 0)
-	if token.AllowIps == nil {
-		return ipLimits
+	return parseIPEntries(token.AllowIps)
+}
+
+func (token *Token) GetUsedIps() []string {
+	return parseIPEntries(token.UsedIps)
+}
+
+func parseIPEntries(raw *string) []string {
+	entries := make([]string, 0)
+	if raw == nil {
+		return entries
 	}
-	cleanIps := strings.ReplaceAll(*token.AllowIps, " ", "")
-	if cleanIps == "" {
-		return ipLimits
+	cleanValue := strings.ReplaceAll(*raw, " ", "")
+	if cleanValue == "" {
+		return entries
 	}
-	ips := strings.Split(cleanIps, "\n")
-	for _, ip := range ips {
-		ip = strings.TrimSpace(ip)
-		ip = strings.ReplaceAll(ip, ",", "")
-		if ip != "" {
-			ipLimits = append(ipLimits, ip)
+	parts := strings.Split(cleanValue, "\n")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		part = strings.ReplaceAll(part, ",", "")
+		if part != "" {
+			entries = append(entries, part)
 		}
 	}
-	return ipLimits
+	return deduplicateIPEntries(entries)
+}
+
+func deduplicateIPEntries(entries []string) []string {
+	if len(entries) == 0 {
+		return entries
+	}
+	seen := make(map[string]struct{}, len(entries))
+	normalized := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry == "" {
+			continue
+		}
+		if _, ok := seen[entry]; ok {
+			continue
+		}
+		seen[entry] = struct{}{}
+		normalized = append(normalized, entry)
+	}
+	return normalized
+}
+
+func joinIPEntries(entries []string) *string {
+	cleanEntries := deduplicateIPEntries(entries)
+	if len(cleanEntries) == 0 {
+		empty := ""
+		return &empty
+	}
+	joined := strings.Join(cleanEntries, "\n")
+	return &joined
+}
+
+func (token *Token) RegisterUsedIP(clientIP string, maxIPs int) (bool, error) {
+	if maxIPs <= 0 {
+		return true, nil
+	}
+	clientIP = strings.TrimSpace(clientIP)
+	if clientIP == "" {
+		return false, errors.New("客户端 IP 为空")
+	}
+	if token.Id == 0 {
+		return false, errors.New("token id 为空")
+	}
+
+	tx := DB.Begin()
+	if tx.Error != nil {
+		return false, tx.Error
+	}
+
+	currentToken := Token{}
+	if err := tx.Where("id = ?", token.Id).First(&currentToken).Error; err != nil {
+		tx.Rollback()
+		return false, err
+	}
+
+	usedIPs := currentToken.GetUsedIps()
+	for _, usedIP := range usedIPs {
+		if usedIP == clientIP {
+			tx.Rollback()
+			token.UsedIps = currentToken.UsedIps
+			return true, nil
+		}
+	}
+	if len(usedIPs) >= maxIPs {
+		tx.Rollback()
+		token.UsedIps = currentToken.UsedIps
+		return false, nil
+	}
+
+	currentToken.UsedIps = joinIPEntries(append(usedIPs, clientIP))
+	if err := tx.Model(&currentToken).Update("used_ips", currentToken.UsedIps).Error; err != nil {
+		tx.Rollback()
+		return false, err
+	}
+	if err := tx.Commit().Error; err != nil {
+		return false, err
+	}
+
+	token.UsedIps = currentToken.UsedIps
+	if shouldUpdateRedis(true, nil) {
+		gopool.Go(func() {
+			if err := cacheSetToken(*token); err != nil {
+				common.SysLog("failed to update token cache: " + err.Error())
+			}
+		})
+	}
+	return true, nil
 }
 
 func GetAllUserTokens(userId int, startIdx int, num int) ([]*Token, error) {
@@ -304,7 +397,7 @@ func (token *Token) Update() (err error) {
 		}
 	}()
 	err = DB.Model(token).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota",
-		"model_limits_enabled", "model_limits", "allow_ips", "group", "cross_group_retry").Updates(token).Error
+		"model_limits_enabled", "model_limits", "allow_ips", "used_ips", "group", "cross_group_retry").Updates(token).Error
 	return err
 }
 

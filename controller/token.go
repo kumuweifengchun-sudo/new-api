@@ -9,7 +9,6 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
-	"github.com/QuantumNous/new-api/setting/operation_setting"
 
 	"github.com/gin-gonic/gin"
 )
@@ -187,8 +186,13 @@ func AddToken(c *gin.Context) {
 			return
 		}
 	}
+	currentUser, err := model.GetUserById(c.GetInt("id"), false)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	// 检查用户令牌数量是否已达上限
-	maxTokens := operation_setting.GetMaxUserTokens()
+	maxTokens := currentUser.GetEffectiveMaxTokens()
 	count, err := model.CountUserTokens(c.GetInt("id"))
 	if err != nil {
 		common.ApiError(c, err)
