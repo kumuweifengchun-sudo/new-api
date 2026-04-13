@@ -15,6 +15,57 @@ import (
 
 const DefaultChannelBaseURLProbeTimeout = 3 * time.Second
 
+func isEmptyNodeBaseURLProbeState(state dto.NodeBaseURLProbeState) bool {
+	return strings.TrimSpace(state.PreferredBaseURL) == "" &&
+		state.BaseURLProbeLastTime == 0 &&
+		len(state.BaseURLProbeResults) == 0 &&
+		strings.TrimSpace(state.LastSuccessBaseURL) == "" &&
+		state.LastSuccessAt == 0
+}
+
+func saveNodeBaseURLProbeState(
+	channelID int,
+	nodeID string,
+	mutate func(state dto.NodeBaseURLProbeState, validURLs []string) dto.NodeBaseURLProbeState,
+) error {
+	nodeID = strings.TrimSpace(nodeID)
+	if channelID <= 0 || nodeID == "" {
+		return nil
+	}
+
+	channel, err := model.GetChannelById(channelID, true)
+	if err != nil {
+		return err
+	}
+	if channel == nil || !channel.HasMultipleBaseURLs() {
+		return nil
+	}
+
+	validURLs := channel.GetBaseURLs()
+	settings := channel.GetOtherSettings()
+	settings.BaseURLProbeByNode = model.FilterBaseURLProbeStatesByNode(settings.BaseURLProbeByNode, validURLs)
+
+	state := settings.BaseURLProbeByNode[nodeID]
+	state = model.NormalizeBaseURLProbeState(state, validURLs)
+	state = model.NormalizeBaseURLProbeState(mutate(state, validURLs), validURLs)
+
+	if isEmptyNodeBaseURLProbeState(state) {
+		delete(settings.BaseURLProbeByNode, nodeID)
+	} else {
+		if settings.BaseURLProbeByNode == nil {
+			settings.BaseURLProbeByNode = make(map[string]dto.NodeBaseURLProbeState)
+		}
+		settings.BaseURLProbeByNode[nodeID] = state
+	}
+
+	channel.SetOtherSettings(settings)
+	if err := channel.SaveOtherSettings(); err != nil {
+		return err
+	}
+	model.CacheUpdateChannel(channel)
+	return nil
+}
+
 func resolveProbeAddress(rawURL string) (string, error) {
 	parsed, err := neturl.Parse(rawURL)
 	if err != nil {
@@ -91,33 +142,23 @@ func ProbeChannelBaseURLs(channel *model.Channel, timeout time.Duration) (string
 	return preferred, results
 }
 
-func persistChannelBaseURLProbe(channel *model.Channel, preferred string, results []dto.BaseURLProbeResult, checkedAt int64) error {
-	if channel == nil {
-		return nil
-	}
-
-	validURLs := channel.GetBaseURLs()
-	settings := channel.GetOtherSettings()
-	settings.BaseURLProbeResults = model.FilterBaseURLProbeResults(results, validURLs)
-	settings.BaseURLProbeLastTime = checkedAt
-	if preferred != "" {
-		for _, candidate := range validURLs {
-			if candidate == preferred {
-				settings.PreferredBaseURL = preferred
-				break
+func persistChannelBaseURLProbe(channelID int, nodeID string, preferred string, results []dto.BaseURLProbeResult, checkedAt int64) error {
+	return saveNodeBaseURLProbeState(channelID, nodeID, func(state dto.NodeBaseURLProbeState, validURLs []string) dto.NodeBaseURLProbeState {
+		state.BaseURLProbeResults = model.FilterBaseURLProbeResults(results, validURLs)
+		state.BaseURLProbeLastTime = checkedAt
+		if preferred != "" {
+			for _, candidate := range validURLs {
+				if candidate == preferred {
+					state.PreferredBaseURL = preferred
+					break
+				}
 			}
 		}
-	}
-	if settings.PreferredBaseURL == "" && len(validURLs) > 0 {
-		settings.PreferredBaseURL = validURLs[0]
-	}
-
-	channel.SetOtherSettings(settings)
-	if err := channel.SaveOtherSettings(); err != nil {
-		return err
-	}
-	model.CacheUpdateChannel(channel)
-	return nil
+		if state.PreferredBaseURL == "" && len(validURLs) > 0 {
+			state.PreferredBaseURL = validURLs[0]
+		}
+		return state
+	})
 }
 
 func ProbeAndPersistChannelBaseURLByID(channelID int, timeout time.Duration) error {
@@ -130,7 +171,7 @@ func ProbeAndPersistChannelBaseURLByID(channelID int, timeout time.Duration) err
 	}
 
 	preferred, results := ProbeChannelBaseURLs(channel, timeout)
-	return persistChannelBaseURLProbe(channel, preferred, results, common.GetTimestamp())
+	return persistChannelBaseURLProbe(channelID, common.NodeID, preferred, results, common.GetTimestamp())
 }
 
 func SetPreferredChannelBaseURL(channelID int, preferred string) error {
@@ -158,14 +199,12 @@ func SetPreferredChannelBaseURL(channelID int, preferred string) error {
 		return nil
 	}
 
-	settings := channel.GetOtherSettings()
-	settings.PreferredBaseURL = preferred
-	channel.SetOtherSettings(settings)
-	if err := channel.SaveOtherSettings(); err != nil {
-		return err
-	}
-	model.CacheUpdateChannel(channel)
-	return nil
+	return saveNodeBaseURLProbeState(channelID, common.NodeID, func(state dto.NodeBaseURLProbeState, validURLs []string) dto.NodeBaseURLProbeState {
+		state.PreferredBaseURL = preferred
+		state.LastSuccessBaseURL = preferred
+		state.LastSuccessAt = common.GetTimestamp()
+		return state
+	})
 }
 
 func TriggerChannelBaseURLProbe(channelIDs ...int) {
@@ -175,7 +214,7 @@ func TriggerChannelBaseURLProbe(channelIDs ...int) {
 		}
 		go func(id int) {
 			if err := ProbeAndPersistChannelBaseURLByID(id, DefaultChannelBaseURLProbeTimeout); err != nil {
-				common.SysLog(fmt.Sprintf("channel base_url probe failed: channel_id=%d err=%v", id, err))
+				common.SysLog(fmt.Sprintf("channel base_url probe failed: node_id=%s channel_id=%d err=%v", common.NodeID, id, err))
 			}
 		}(channelID)
 	}
@@ -191,8 +230,8 @@ func ProbeAndPersistAllMultiBaseURLChannels(timeout time.Duration) error {
 			continue
 		}
 		preferred, results := ProbeChannelBaseURLs(channel, timeout)
-		if err := persistChannelBaseURLProbe(channel, preferred, results, common.GetTimestamp()); err != nil {
-			common.SysLog(fmt.Sprintf("persist channel base_url probe failed: channel_id=%d err=%v", channel.Id, err))
+		if err := persistChannelBaseURLProbe(channel.Id, common.NodeID, preferred, results, common.GetTimestamp()); err != nil {
+			common.SysLog(fmt.Sprintf("persist channel base_url probe failed: node_id=%s channel_id=%d err=%v", common.NodeID, channel.Id, err))
 		}
 	}
 	return nil

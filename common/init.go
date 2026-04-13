@@ -82,6 +82,21 @@ func InitEnv() {
 	DebugEnabled = os.Getenv("DEBUG") == "true"
 	MemoryCacheEnabled = os.Getenv("MEMORY_CACHE_ENABLED") == "true"
 	IsMasterNode = os.Getenv("NODE_TYPE") != "slave"
+	NodeID = strings.TrimSpace(os.Getenv("NODE_ID"))
+	if NodeID == "" {
+		hostname, err := os.Hostname()
+		if err == nil {
+			hostname = strings.TrimSpace(hostname)
+		}
+		if hostname != "" {
+			NodeID = hostname
+		} else if IsMasterNode {
+			NodeID = "master"
+		} else {
+			NodeID = "slave"
+		}
+		log.Printf("WARNING: NODE_ID is not set, falling back to %q", NodeID)
+	}
 	TLSInsecureSkipVerify = GetEnvOrDefaultBool("TLS_INSECURE_SKIP_VERIFY", false)
 	if TLSInsecureSkipVerify {
 		if tr, ok := http.DefaultTransport.(*http.Transport); ok && tr != nil {

@@ -140,6 +140,46 @@ const splitBaseUrlLines = (value) =>
     .map((item) => item.trim())
     .filter(Boolean);
 
+const EMPTY_BASE_URL_PROBE_STATE = {
+  preferredBaseURL: '',
+  lastTime: 0,
+  results: [],
+  lastSuccessBaseURL: '',
+  lastSuccessAt: 0,
+};
+
+const normalizeBaseURLProbeState = (state) => {
+  if (!state || typeof state !== 'object') {
+    return { ...EMPTY_BASE_URL_PROBE_STATE };
+  }
+  return {
+    preferredBaseURL:
+      state.preferred_base_url || state.preferredBaseURL || '',
+    lastTime:
+      Number(
+        state.base_url_probe_last_time || state.baseURLProbeLastTime || 0,
+      ) || 0,
+    results: Array.isArray(state.base_url_probe_results)
+      ? state.base_url_probe_results
+      : Array.isArray(state.baseURLProbeResults)
+        ? state.baseURLProbeResults
+        : [],
+    lastSuccessBaseURL:
+      state.last_success_base_url || state.lastSuccessBaseURL || '',
+    lastSuccessAt:
+      Number(state.last_success_at || state.lastSuccessAt || 0) || 0,
+  };
+};
+
+const hasBaseURLProbeStateData = (state) =>
+  Boolean(
+    state?.preferredBaseURL ||
+      state?.lastTime ||
+      state?.lastSuccessBaseURL ||
+      state?.lastSuccessAt ||
+      (Array.isArray(state?.results) && state.results.length > 0),
+  );
+
 const normalizeBaseUrlInput = (value) => {
   const seen = new Set();
   return splitBaseUrlLines(value)
@@ -283,30 +323,62 @@ const EditChannelModal = (props) => {
     }
   }, [inputs.model_mapping]);
   const baseURLProbeInfo = useMemo(() => {
+    const currentNodeID = String(props.editingChannel.current_node_id || '').trim();
+    const empty = {
+      currentNodeID,
+      currentNodeState: { ...EMPTY_BASE_URL_PROBE_STATE },
+      nodes: [],
+      usingLegacyFallback: false,
+    };
     if (!inputs.settings) {
-      return {
-        preferredBaseURL: '',
-        lastTime: 0,
-        results: [],
-      };
+      return empty;
     }
     try {
       const parsed = JSON.parse(inputs.settings);
+      const nodeStates =
+        parsed.base_url_probe_by_node &&
+        typeof parsed.base_url_probe_by_node === 'object' &&
+        !Array.isArray(parsed.base_url_probe_by_node)
+          ? parsed.base_url_probe_by_node
+          : {};
+      const nodes = Object.entries(nodeStates)
+        .map(([nodeId, state]) => ({
+          nodeId,
+          isCurrentNode: nodeId === currentNodeID,
+          ...normalizeBaseURLProbeState(state),
+        }))
+        .filter(
+          (item) => item.nodeId && hasBaseURLProbeStateData(item),
+        )
+        .sort((a, b) => {
+          if (a.isCurrentNode && !b.isCurrentNode) {
+            return -1;
+          }
+          if (!a.isCurrentNode && b.isCurrentNode) {
+            return 1;
+          }
+          return a.nodeId.localeCompare(b.nodeId);
+        });
+
+      let currentNodeState = currentNodeID
+        ? normalizeBaseURLProbeState(nodeStates[currentNodeID])
+        : { ...EMPTY_BASE_URL_PROBE_STATE };
+      let usingLegacyFallback = false;
+      if (!hasBaseURLProbeStateData(currentNodeState) && nodes.length === 0) {
+        currentNodeState = normalizeBaseURLProbeState(parsed);
+        usingLegacyFallback = hasBaseURLProbeStateData(currentNodeState);
+      }
+
       return {
-        preferredBaseURL: parsed.preferred_base_url || '',
-        lastTime: Number(parsed.base_url_probe_last_time) || 0,
-        results: Array.isArray(parsed.base_url_probe_results)
-          ? parsed.base_url_probe_results
-          : [],
+        currentNodeID,
+        currentNodeState,
+        nodes,
+        usingLegacyFallback,
       };
     } catch (error) {
-      return {
-        preferredBaseURL: '',
-        lastTime: 0,
-        results: [],
-      };
+      return empty;
     }
-  }, [inputs.settings]);
+  }, [inputs.settings, props.editingChannel.current_node_id]);
   const configuredBaseURLs = useMemo(
     () => splitBaseUrlLines(inputs.base_url),
     [inputs.base_url],
@@ -3474,41 +3546,141 @@ const EditChannelModal = (props) => {
                           description={
                             <div className='flex flex-col gap-2'>
                               <Text>
+                                {t('当前节点')}:{' '}
+                                {baseURLProbeInfo.currentNodeID || t('未知')}
+                              </Text>
+                              <Text>
                                 {t('当前最优地址')}:{' '}
-                                {baseURLProbeInfo.preferredBaseURL || t('暂无')}
+                                {baseURLProbeInfo.currentNodeState
+                                  .preferredBaseURL || t('暂无')}
                               </Text>
                               <Text>
                                 {t('上次TCP测速')}:{' '}
-                                {formatUnixTime(baseURLProbeInfo.lastTime)}
+                                {formatUnixTime(
+                                  baseURLProbeInfo.currentNodeState.lastTime,
+                                )}
                               </Text>
-                              {baseURLProbeInfo.results.length > 0 ? (
+                              {baseURLProbeInfo.currentNodeState
+                                .lastSuccessBaseURL && (
+                                <Text>
+                                  {t('最近成功地址')}:{' '}
+                                  {
+                                    baseURLProbeInfo.currentNodeState
+                                      .lastSuccessBaseURL
+                                  }
+                                </Text>
+                              )}
+                              {baseURLProbeInfo.usingLegacyFallback && (
+                                <Tag color='orange' size='small'>
+                                  {t('当前显示的是历史全局测速记录')}
+                                </Tag>
+                              )}
+                              {baseURLProbeInfo.currentNodeState.results.length >
+                              0 ? (
                                 <div className='flex flex-col gap-1'>
-                                  {baseURLProbeInfo.results.map((item) => (
-                                    <div
-                                      key={item.url}
-                                      className='flex flex-wrap items-center gap-2'
-                                    >
-                                      <Text>{item.url}</Text>
-                                      <Tag
-                                        color={item.success ? 'green' : 'red'}
-                                        size='small'
+                                  {baseURLProbeInfo.currentNodeState.results.map(
+                                    (item) => (
+                                      <div
+                                        key={`current-${item.url}`}
+                                        className='flex flex-wrap items-center gap-2'
                                       >
-                                        {item.success
-                                          ? `${item.latency_ms || 0} ms`
-                                          : t('失败')}
-                                      </Tag>
-                                      {!item.success && item.error && (
-                                        <Text type='tertiary' size='small'>
-                                          {item.error}
+                                        <Text>{item.url}</Text>
+                                        <Tag
+                                          color={
+                                            item.success ? 'green' : 'red'
+                                          }
+                                          size='small'
+                                        >
+                                          {item.success
+                                            ? `${item.latency_ms || 0} ms`
+                                            : t('失败')}
+                                        </Tag>
+                                        {!item.success && item.error && (
+                                          <Text
+                                            type='tertiary'
+                                            size='small'
+                                          >
+                                            {item.error}
+                                          </Text>
+                                        )}
+                                      </div>
+                                    ),
+                                  )}
+                                </div>
+                              ) : (
+                                <Text type='tertiary'>
+                                  {t('当前节点暂无TCP测速记录，保存后将自动生成')}
+                                </Text>
+                              )}
+                              {baseURLProbeInfo.nodes.length > 0 && (
+                                <div className='mt-2 flex flex-col gap-2'>
+                                  <Text strong>{t('各节点测速详情')}</Text>
+                                  {baseURLProbeInfo.nodes.map((node) => (
+                                    <div
+                                      key={node.nodeId}
+                                      className='flex flex-col gap-1 rounded-lg border border-[var(--semi-color-border)] p-3'
+                                    >
+                                      <div className='flex flex-wrap items-center gap-2'>
+                                        <Text strong>{node.nodeId}</Text>
+                                        {node.isCurrentNode && (
+                                          <Tag color='blue' size='small'>
+                                            {t('当前节点')}
+                                          </Tag>
+                                        )}
+                                      </div>
+                                      <Text>
+                                        {t('当前最优地址')}:{' '}
+                                        {node.preferredBaseURL || t('暂无')}
+                                      </Text>
+                                      <Text>
+                                        {t('上次TCP测速')}:{' '}
+                                        {formatUnixTime(node.lastTime)}
+                                      </Text>
+                                      {node.lastSuccessBaseURL && (
+                                        <Text>
+                                          {t('最近成功地址')}:{' '}
+                                          {node.lastSuccessBaseURL}
+                                        </Text>
+                                      )}
+                                      {node.results.length > 0 ? (
+                                        <div className='flex flex-col gap-1'>
+                                          {node.results.map((item) => (
+                                            <div
+                                              key={`${node.nodeId}-${item.url}`}
+                                              className='flex flex-wrap items-center gap-2'
+                                            >
+                                              <Text>{item.url}</Text>
+                                              <Tag
+                                                color={
+                                                  item.success
+                                                    ? 'green'
+                                                    : 'red'
+                                                }
+                                                size='small'
+                                              >
+                                                {item.success
+                                                  ? `${item.latency_ms || 0} ms`
+                                                  : t('失败')}
+                                              </Tag>
+                                              {!item.success && item.error && (
+                                                <Text
+                                                  type='tertiary'
+                                                  size='small'
+                                                >
+                                                  {item.error}
+                                                </Text>
+                                              )}
+                                            </div>
+                                          ))}
+                                        </div>
+                                      ) : (
+                                        <Text type='tertiary'>
+                                          {t('暂无TCP测速记录')}
                                         </Text>
                                       )}
                                     </div>
                                   ))}
                                 </div>
-                              ) : (
-                                <Text type='tertiary'>
-                                  {t('暂无TCP测速记录，保存后将自动生成')}
-                                </Text>
                               )}
                             </div>
                           }

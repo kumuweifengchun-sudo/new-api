@@ -45,7 +45,6 @@ services:
     depends_on:
       - redis
       - postgres
-#      - mysql  # Uncomment if using MySQL
     networks:
       - new-api-network
     healthcheck:

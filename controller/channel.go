@@ -68,6 +68,19 @@ func clearChannelInfo(channel *model.Channel) {
 	}
 }
 
+func attachChannelRuntimeInfo(channel *model.Channel) {
+	if channel == nil {
+		return
+	}
+	channel.CurrentNodeID = common.NodeID
+}
+
+func attachChannelRuntimeInfoList(channels []*model.Channel) {
+	for _, channel := range channels {
+		attachChannelRuntimeInfo(channel)
+	}
+}
+
 func GetAllChannels(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
 	channelData := make([]*model.Channel, 0)
@@ -147,6 +160,7 @@ func GetAllChannels(c *gin.Context) {
 	for _, datum := range channelData {
 		clearChannelInfo(datum)
 	}
+	attachChannelRuntimeInfoList(channelData)
 
 	countQuery := model.DB.Model(&model.Channel{})
 	if statusFilter == common.ChannelStatusEnabled {
@@ -345,6 +359,7 @@ func SearchChannels(c *gin.Context) {
 	for _, datum := range pagedData {
 		clearChannelInfo(datum)
 	}
+	attachChannelRuntimeInfoList(pagedData)
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
@@ -371,6 +386,7 @@ func GetChannel(c *gin.Context) {
 	}
 	if channel != nil {
 		clearChannelInfo(channel)
+		attachChannelRuntimeInfo(channel)
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
@@ -562,6 +578,7 @@ func syncChannelBaseURLProbeSettings(channel *model.Channel) {
 		settings.PreferredBaseURL = ""
 		settings.BaseURLProbeLastTime = 0
 		settings.BaseURLProbeResults = nil
+		settings.BaseURLProbeByNode = nil
 		channel.SetOtherSettings(settings)
 		return
 	}
@@ -577,6 +594,7 @@ func syncChannelBaseURLProbeSettings(channel *model.Channel) {
 	if !preferredValid {
 		settings.PreferredBaseURL = ""
 	}
+	settings.BaseURLProbeByNode = model.FilterBaseURLProbeStatesByNode(settings.BaseURLProbeByNode, validURLs)
 	channel.SetOtherSettings(settings)
 }
 
@@ -1049,6 +1067,7 @@ func UpdateChannel(c *gin.Context) {
 	}
 	channel.Key = ""
 	clearChannelInfo(&channel.Channel)
+	attachChannelRuntimeInfo(&channel.Channel)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",

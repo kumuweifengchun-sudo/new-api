@@ -55,6 +55,8 @@ type Channel struct {
 
 	// cache info
 	Keys []string `json:"-" gorm:"-"`
+
+	CurrentNodeID string `json:"current_node_id,omitempty" gorm:"-"`
 }
 
 type ChannelInfo struct {

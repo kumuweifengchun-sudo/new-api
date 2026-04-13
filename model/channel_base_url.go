@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 )
@@ -88,6 +89,85 @@ func (channel *Channel) HasMultipleBaseURLs() bool {
 	return len(channel.GetBaseURLs()) > 1
 }
 
+func isValidBaseURLCandidate(candidate string, validURLs []string) bool {
+	for _, value := range validURLs {
+		if value == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func NormalizeBaseURLProbeState(state dto.NodeBaseURLProbeState, validURLs []string) dto.NodeBaseURLProbeState {
+	if len(validURLs) == 0 {
+		return dto.NodeBaseURLProbeState{}
+	}
+
+	state.BaseURLProbeResults = FilterBaseURLProbeResults(state.BaseURLProbeResults, validURLs)
+	if !isValidBaseURLCandidate(strings.TrimSpace(state.PreferredBaseURL), validURLs) {
+		state.PreferredBaseURL = ""
+	}
+	if !isValidBaseURLCandidate(strings.TrimSpace(state.LastSuccessBaseURL), validURLs) {
+		state.LastSuccessBaseURL = ""
+		state.LastSuccessAt = 0
+	}
+	return state
+}
+
+func FilterBaseURLProbeStatesByNode(states map[string]dto.NodeBaseURLProbeState, validURLs []string) map[string]dto.NodeBaseURLProbeState {
+	if len(states) == 0 || len(validURLs) == 0 {
+		return nil
+	}
+
+	filtered := make(map[string]dto.NodeBaseURLProbeState, len(states))
+	for nodeID, state := range states {
+		nodeID = strings.TrimSpace(nodeID)
+		if nodeID == "" {
+			continue
+		}
+		normalized := NormalizeBaseURLProbeState(state, validURLs)
+		if normalized.PreferredBaseURL == "" &&
+			normalized.BaseURLProbeLastTime == 0 &&
+			len(normalized.BaseURLProbeResults) == 0 &&
+			normalized.LastSuccessBaseURL == "" &&
+			normalized.LastSuccessAt == 0 {
+			continue
+		}
+		filtered[nodeID] = normalized
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	return filtered
+}
+
+func (channel *Channel) GetLegacyBaseURLProbeState() dto.NodeBaseURLProbeState {
+	if channel == nil {
+		return dto.NodeBaseURLProbeState{}
+	}
+	settings := channel.GetOtherSettings()
+	return NormalizeBaseURLProbeState(dto.NodeBaseURLProbeState{
+		PreferredBaseURL:     settings.PreferredBaseURL,
+		BaseURLProbeLastTime: settings.BaseURLProbeLastTime,
+		BaseURLProbeResults:  settings.BaseURLProbeResults,
+	}, channel.GetBaseURLs())
+}
+
+func (channel *Channel) GetBaseURLProbeStateByNode(nodeID string) dto.NodeBaseURLProbeState {
+	if channel == nil {
+		return dto.NodeBaseURLProbeState{}
+	}
+	settings := channel.GetOtherSettings()
+	if len(settings.BaseURLProbeByNode) == 0 {
+		return dto.NodeBaseURLProbeState{}
+	}
+	return NormalizeBaseURLProbeState(settings.BaseURLProbeByNode[strings.TrimSpace(nodeID)], channel.GetBaseURLs())
+}
+
+func (channel *Channel) GetCurrentNodeBaseURLProbeState() dto.NodeBaseURLProbeState {
+	return channel.GetBaseURLProbeStateByNode(common.NodeID)
+}
+
 func (channel *Channel) GetPreferredBaseURL() string {
 	urls := channel.GetBaseURLs()
 	if len(urls) == 0 {
@@ -97,31 +177,26 @@ func (channel *Channel) GetPreferredBaseURL() string {
 		return urls[0]
 	}
 
-	settings := channel.GetOtherSettings()
-	preferred := strings.TrimSpace(settings.PreferredBaseURL)
+	state := channel.GetCurrentNodeBaseURLProbeState()
+	preferred := strings.TrimSpace(state.PreferredBaseURL)
 	if preferred != "" {
-		for _, candidate := range urls {
-			if candidate == preferred {
-				return candidate
-			}
+		if isValidBaseURLCandidate(preferred, urls) {
+			return preferred
 		}
 	}
 
 	bestURL := ""
 	var bestLatency int64
-	for _, result := range settings.BaseURLProbeResults {
+	for _, result := range state.BaseURLProbeResults {
 		if !result.Success {
 			continue
 		}
-		for _, candidate := range urls {
-			if candidate != result.URL {
-				continue
-			}
-			if bestURL == "" || result.LatencyMs < bestLatency {
-				bestURL = candidate
-				bestLatency = result.LatencyMs
-			}
-			break
+		if !isValidBaseURLCandidate(result.URL, urls) {
+			continue
+		}
+		if bestURL == "" || result.LatencyMs < bestLatency {
+			bestURL = result.URL
+			bestLatency = result.LatencyMs
 		}
 	}
 	if bestURL != "" {

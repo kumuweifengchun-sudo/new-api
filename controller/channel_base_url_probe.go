@@ -44,10 +44,6 @@ func nextDailyRun(now time.Time, clock string) time.Time {
 }
 
 func StartChannelBaseURLProbeTask() {
-	if !common.IsMasterNode {
-		return
-	}
-
 	channelBaseURLProbeTaskOnce.Do(func() {
 		go func() {
 			for {
@@ -60,7 +56,7 @@ func StartChannelBaseURLProbeTask() {
 				now := time.Now()
 				nextRun := nextDailyRun(now, monitorSetting.ChannelTCPProbeScheduleTime)
 				waitFor := time.Until(nextRun)
-				common.SysLog(fmt.Sprintf("channel base_url probe task scheduled at %s", nextRun.Format(time.RFC3339)))
+				common.SysLog(fmt.Sprintf("channel base_url probe task scheduled: node_id=%s run_at=%s", common.NodeID, nextRun.Format(time.RFC3339)))
 				time.Sleep(waitFor)
 
 				monitorSetting = operation_setting.GetMonitorSetting()
@@ -68,11 +64,11 @@ func StartChannelBaseURLProbeTask() {
 					continue
 				}
 
-				common.SysLog("channel base_url probe task started")
+				common.SysLog(fmt.Sprintf("channel base_url probe task started: node_id=%s", common.NodeID))
 				if err := service.ProbeAndPersistAllMultiBaseURLChannels(service.DefaultChannelBaseURLProbeTimeout); err != nil {
-					common.SysLog(fmt.Sprintf("channel base_url probe task failed: %v", err))
+					common.SysLog(fmt.Sprintf("channel base_url probe task failed: node_id=%s err=%v", common.NodeID, err))
 				}
-				common.SysLog("channel base_url probe task finished")
+				common.SysLog(fmt.Sprintf("channel base_url probe task finished: node_id=%s", common.NodeID))
 			}
 		}()
 	})
