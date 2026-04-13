@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/common/limiter"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting"
 
 	"github.com/gin-gonic/gin"
@@ -20,6 +21,39 @@ const (
 	ModelRequestRateLimitCountMark        = "MRRL"
 	ModelRequestRateLimitSuccessCountMark = "MRRLS"
 )
+
+func getUserRateLimitOverride(user *model.UserBase) (totalCount, successCount int, found bool) {
+	if user == nil {
+		return 0, 0, false
+	}
+	if user.ModelRequestRateLimitCountOverride == nil && user.ModelRequestRateLimitSuccessCountOverride == nil {
+		return 0, 0, false
+	}
+	if user.ModelRequestRateLimitCountOverride == nil || user.ModelRequestRateLimitSuccessCountOverride == nil {
+		common.SysLog(fmt.Sprintf("ignore incomplete user model rate limit override, user_id=%d", user.Id))
+		return 0, 0, false
+	}
+	return *user.ModelRequestRateLimitCountOverride, *user.ModelRequestRateLimitSuccessCountOverride, true
+}
+
+func resolveEffectiveModelRequestRateLimit(group string, user *model.UserBase) (totalCount, successCount int) {
+	totalCount = setting.ModelRequestRateLimitCount
+	successCount = setting.ModelRequestRateLimitSuccessCount
+
+	groupTotalCount, groupSuccessCount, found := setting.GetGroupRateLimit(group)
+	if found {
+		totalCount = groupTotalCount
+		successCount = groupSuccessCount
+	}
+
+	userTotalCount, userSuccessCount, found := getUserRateLimitOverride(user)
+	if found {
+		totalCount = userTotalCount
+		successCount = userSuccessCount
+	}
+
+	return totalCount, successCount
+}
 
 // 检查Redis中的请求限制
 func checkRedisRateLimit(ctx context.Context, rdb *redis.Client, key string, maxCount int, duration int64) (bool, error) {
@@ -115,6 +149,7 @@ func redisRateLimitHandler(duration int64, totalMaxCount, successMaxCount int) g
 
 			if !allowed {
 				abortWithOpenAiMessage(c, http.StatusTooManyRequests, fmt.Sprintf("您已达到总请求数限制：%d分钟内最多请求%d次，包括失败次数，请检查您的请求是否正确", setting.ModelRequestRateLimitDurationMinutes, totalMaxCount))
+				return
 			}
 		}
 
@@ -182,13 +217,18 @@ func ModelRequestRateLimit() func(c *gin.Context) {
 		if group == "" {
 			group = common.GetContextKeyString(c, constant.ContextKeyUserGroup)
 		}
-
-		//获取分组的限流配置
-		groupTotalCount, groupSuccessCount, found := setting.GetGroupRateLimit(group)
-		if found {
-			totalMaxCount = groupTotalCount
-			successMaxCount = groupSuccessCount
+		var userCache *model.UserBase
+		userID := c.GetInt("id")
+		if userID != 0 {
+			user, err := model.GetUserCache(userID)
+			if err != nil {
+				common.SysLog(fmt.Sprintf("failed to load user cache for model rate limit, user_id=%d, err=%v", userID, err))
+				abortWithOpenAiMessage(c, http.StatusInternalServerError, "rate_limit_check_failed")
+				return
+			}
+			userCache = user
 		}
+		totalMaxCount, successMaxCount = resolveEffectiveModelRequestRateLimit(group, userCache)
 
 		// 根据存储类型选择并执行限流处理器
 		if common.RedisEnabled {

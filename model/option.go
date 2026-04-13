@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"strconv"
 	"strings"
 	"time"
@@ -22,7 +23,7 @@ type Option struct {
 func AllOption() ([]*Option, error) {
 	var options []*Option
 	var err error
-	err = DB.Find(&options).Error
+	err = DB.Model(&Option{}).Select("key", "value").Find(&options).Error
 	return options, err
 }
 
@@ -174,6 +175,7 @@ func InitOptionMap() {
 
 	common.OptionMapRWMutex.Unlock()
 	loadOptionsFromDatabase()
+	SyncOptionStoreFromCompat()
 }
 
 func loadOptionsFromDatabase() {
@@ -184,13 +186,16 @@ func loadOptionsFromDatabase() {
 			common.SysLog("failed to update option map: " + err.Error())
 		}
 	}
+	SyncOptionStoreFromCompat()
 }
 
 func SyncOptions(frequency int) {
 	for {
 		time.Sleep(time.Duration(frequency) * time.Second)
 		common.SysLog("syncing options from database")
-		loadOptionsFromDatabase()
+		if err := RefreshOptionsFromDB(context.Background(), "legacy-periodic-sync", false); err != nil {
+			common.SysLog("failed to sync options from database: " + err.Error())
+		}
 	}
 }
 
@@ -205,18 +210,32 @@ func UpdateOption(key string, value string) error {
 	// Save is a combination function.
 	// If save value does not contain primary key, it will execute Create,
 	// otherwise it will execute Update (with all fields).
-	DB.Save(&option)
+	if err := DB.Save(&option).Error; err != nil {
+		return err
+	}
 	// Update OptionMap
-	return updateOptionMap(key, value)
+	if err := updateOptionMap(key, value); err != nil {
+		return err
+	}
+	if err := PublishOptionSyncEvent(OptionSyncEvent{
+		Event:     OptionSyncEventUpdated,
+		Key:       key,
+		NodeID:    common.NodeID,
+		UpdatedAt: time.Now().Unix(),
+	}); err != nil {
+		common.SysLog("failed to publish option sync event: " + err.Error())
+	}
+	return nil
 }
 
 func updateOptionMap(key string, value string) (err error) {
 	common.OptionMapRWMutex.Lock()
-	defer common.OptionMapRWMutex.Unlock()
 	common.OptionMap[key] = value
+	common.OptionMapRWMutex.Unlock()
 
 	// 检查是否是模型配置 - 使用更规范的方式处理
 	if handleConfigUpdate(key, value) {
+		SyncOptionStoreFromCompat()
 		return nil // 已由配置系统处理
 	}
 
@@ -512,6 +531,7 @@ func updateOptionMap(key string, value string) (err error) {
 		// The value is already stored in OptionMap at the top of this function (line: common.OptionMap[key] = value).
 		// No additional in-memory variable to update.
 	}
+	SyncOptionStoreFromCompat()
 	return err
 }
 

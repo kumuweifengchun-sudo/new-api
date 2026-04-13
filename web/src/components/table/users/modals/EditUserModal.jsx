@@ -56,6 +56,7 @@ import {
   IconPlus,
 } from '@douyinfe/semi-icons';
 import UserBindingManagementModal from './UserBindingManagementModal';
+import UserRecentIpsModal from './UserRecentIpsModal';
 
 const { Text, Title } = Typography;
 
@@ -69,6 +70,7 @@ const EditUserModal = (props) => {
   const isMobile = useIsMobile();
   const [groupOptions, setGroupOptions] = useState([]);
   const [bindingModalVisible, setBindingModalVisible] = useState(false);
+  const [recentIpsVisible, setRecentIpsVisible] = useState(false);
   const formApiRef = useRef(null);
 
   const isEdit = Boolean(userId);
@@ -87,7 +89,32 @@ const EditUserModal = (props) => {
     quota: 0,
     group: 'default',
     remark: '',
+    model_request_rate_limit_count_override: undefined,
+    model_request_rate_limit_success_count_override: undefined,
   });
+
+  const hasValue = (value) => value !== undefined && value !== null && value !== '';
+
+  const validateRateLimitOverrides = (values) => {
+    const total = values.model_request_rate_limit_count_override;
+    const success = values.model_request_rate_limit_success_count_override;
+    const hasTotal = hasValue(total);
+    const hasSuccess = hasValue(success);
+
+    if (hasTotal !== hasSuccess) {
+      showError(t('用户请求限流覆盖需要同时填写总请求次数和成功请求次数'));
+      return false;
+    }
+    if (hasTotal && Number(total) < 0) {
+      showError(t('用户每周期最多请求次数不能小于 0'));
+      return false;
+    }
+    if (hasSuccess && Number(success) < 1) {
+      showError(t('用户每周期最多请求完成次数不能小于 1'));
+      return false;
+    }
+    return true;
+  };
 
   const fetchGroups = async () => {
     try {
@@ -118,6 +145,7 @@ const EditUserModal = (props) => {
     loadUser();
     if (userId) fetchGroups();
     setBindingModalVisible(false);
+    setRecentIpsVisible(false);
   }, [props.editingUser.id]);
 
   const openBindingModal = () => {
@@ -128,8 +156,17 @@ const EditUserModal = (props) => {
     setBindingModalVisible(false);
   };
 
+  const openRecentIpsModal = () => {
+    setRecentIpsVisible(true);
+  };
+
+  const closeRecentIpsModal = () => {
+    setRecentIpsVisible(false);
+  };
+
   /* ----------------------- submit ----------------------- */
   const submit = async (values) => {
+    if (!validateRateLimitOverrides(values)) return;
     setLoading(true);
     let payload = { ...values };
     if (typeof payload.quota === 'string')
@@ -363,6 +400,54 @@ const EditUserModal = (props) => {
                           />
                         </Form.Slot>
                       </Col>
+
+                      <Col span={24}>
+                        <Form.Slot
+                          label={t('用户每周期最多请求次数')}
+                          extraText={t(
+                            '留空则继承分组/全局限制；填写时需和成功请求次数一起设置，0 表示不限制',
+                          )}
+                        >
+                          <InputNumber
+                            value={
+                              values.model_request_rate_limit_count_override
+                            }
+                            min={0}
+                            placeholder={t('请输入用户每周期最多请求次数')}
+                            onChange={(value) =>
+                              formApiRef.current?.setValue(
+                                'model_request_rate_limit_count_override',
+                                value,
+                              )
+                            }
+                            style={{ width: '100%' }}
+                          />
+                        </Form.Slot>
+                      </Col>
+
+                      <Col span={24}>
+                        <Form.Slot
+                          label={t('用户每周期最多请求完成次数')}
+                          extraText={t(
+                            '留空则继承分组/全局限制；填写时需和总请求次数一起设置',
+                          )}
+                        >
+                          <InputNumber
+                            value={
+                              values.model_request_rate_limit_success_count_override
+                            }
+                            min={1}
+                            placeholder={t('请输入用户每周期最多请求完成次数')}
+                            onChange={(value) =>
+                              formApiRef.current?.setValue(
+                                'model_request_rate_limit_success_count_override',
+                                value,
+                              )
+                            }
+                            style={{ width: '100%' }}
+                          />
+                        </Form.Slot>
+                      </Col>
                     </Row>
                   </Card>
                 )}
@@ -398,6 +483,37 @@ const EditUserModal = (props) => {
                     </div>
                   </Card>
                 )}
+
+                {userId && (
+                  <Card className='!rounded-2xl shadow-sm border-0'>
+                    <div className='flex items-center justify-between gap-3'>
+                      <div className='flex items-center min-w-0'>
+                        <Avatar
+                          size='small'
+                          color='cyan'
+                          className='mr-2 shadow-md'
+                        >
+                          <IconLink size={16} />
+                        </Avatar>
+                        <div className='min-w-0'>
+                          <Text className='text-lg font-medium'>
+                            {t('最近活跃 IP')}
+                          </Text>
+                          <div className='text-xs text-gray-600'>
+                            {t('查看该用户令牌近期来源 IP、最近使用时间和关联令牌')}
+                          </div>
+                        </div>
+                      </div>
+                      <Button
+                        type='primary'
+                        theme='outline'
+                        onClick={openRecentIpsModal}
+                      >
+                        {t('查看 IP')}
+                      </Button>
+                    </div>
+                  </Card>
+                )}
               </div>
             )}
           </Form>
@@ -410,6 +526,15 @@ const EditUserModal = (props) => {
         userId={userId}
         isMobile={isMobile}
         formApiRef={formApiRef}
+      />
+
+      <UserRecentIpsModal
+        visible={recentIpsVisible}
+        onCancel={closeRecentIpsModal}
+        userId={userId}
+        username={formApiRef.current?.getValue('username')}
+        isMobile={isMobile}
+        t={t}
       />
 
       {/* 添加额度模态框 */}

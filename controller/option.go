@@ -63,9 +63,7 @@ func buildCompletionRatioMetaValue(optionValues map[string]string) string {
 func GetOptions(c *gin.Context) {
 	var options []*model.Option
 	optionValues := make(map[string]string)
-	common.OptionMapRWMutex.Lock()
-	for k, v := range common.OptionMap {
-		value := common.Interface2String(v)
+	for k, value := range model.GetOptions() {
 		if strings.HasSuffix(k, "Token") ||
 			strings.HasSuffix(k, "Secret") ||
 			strings.HasSuffix(k, "Key") ||
@@ -84,7 +82,6 @@ func GetOptions(c *gin.Context) {
 			}
 		}
 	}
-	common.OptionMapRWMutex.Unlock()
 	options = append(options, &model.Option{
 		Key:   "CompletionRatioMeta",
 		Value: buildCompletionRatioMetaValue(optionValues),

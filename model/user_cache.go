@@ -15,14 +15,16 @@ import (
 
 // UserBase struct remains the same as it represents the cached data structure
 type UserBase struct {
-	Id             int    `json:"id"`
-	Group          string `json:"group"`
-	Email          string `json:"email"`
-	Quota          int    `json:"quota"`
-	Status         int    `json:"status"`
-	Username       string `json:"username"`
-	Setting        string `json:"setting"`
-	MaxIpsPerToken *int   `json:"max_ips_per_token"`
+	Id                                        int    `json:"id"`
+	Group                                     string `json:"group"`
+	Email                                     string `json:"email"`
+	Quota                                     int    `json:"quota"`
+	Status                                    int    `json:"status"`
+	Username                                  string `json:"username"`
+	Setting                                   string `json:"setting"`
+	MaxIpsPerToken                            *int   `json:"max_ips_per_token"`
+	ModelRequestRateLimitCountOverride        *int   `json:"model_request_rate_limit_count_override"`
+	ModelRequestRateLimitSuccessCountOverride *int   `json:"model_request_rate_limit_success_count_override"`
 }
 
 func (user *UserBase) WriteContext(c *gin.Context) {
@@ -108,14 +110,16 @@ func GetUserCache(userId int) (userCache *UserBase, err error) {
 
 	// Create cache object from user data
 	userCache = &UserBase{
-		Id:             user.Id,
-		Group:          user.Group,
-		Quota:          user.Quota,
-		Status:         user.Status,
-		Username:       user.Username,
-		Setting:        user.Setting,
-		Email:          user.Email,
-		MaxIpsPerToken: user.MaxIpsPerToken,
+		Id:                                 user.Id,
+		Group:                              user.Group,
+		Quota:                              user.Quota,
+		Status:                             user.Status,
+		Username:                           user.Username,
+		Setting:                            user.Setting,
+		Email:                              user.Email,
+		MaxIpsPerToken:                     user.MaxIpsPerToken,
+		ModelRequestRateLimitCountOverride: user.ModelRequestRateLimitCountOverride,
+		ModelRequestRateLimitSuccessCountOverride: user.ModelRequestRateLimitSuccessCountOverride,
 	}
 
 	return userCache, nil

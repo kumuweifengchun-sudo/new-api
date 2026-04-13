@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
@@ -21,23 +22,58 @@ import (
 )
 
 func UpdateMidjourneyTaskBulk() {
-	//imageModel := "midjourney"
 	ctx := context.TODO()
-	for {
-		time.Sleep(time.Duration(15) * time.Second)
+	fallback := model.TaskFallbackInterval()
+	backfillTicker := time.NewTicker(fallback)
+	defer backfillTicker.Stop()
 
-		tasks := model.GetAllUnFinishTasks()
-		if len(tasks) == 0 {
-			continue
+	wakeCh := make(chan struct{}, 1)
+	if pubsub := model.SubscribeTaskSync(); pubsub != nil {
+		go func() {
+			defer pubsub.Close()
+			for msg := range pubsub.Channel() {
+				var event model.TaskSyncEvent
+				if err := common.UnmarshalJsonStr(msg.Payload, &event); err != nil {
+					continue
+				}
+				if event.Kind != "midjourney" {
+					continue
+				}
+				select {
+				case wakeCh <- struct{}{}:
+				default:
+				}
+			}
+		}()
+	}
+
+	process := func(cause string) {
+		ids, err := model.FetchDuePendingMidjourneyIDs(constant.TaskQueryLimit)
+		if err != nil {
+			logger.LogError(ctx, fmt.Sprintf("load due midjourney ids failed: %v", err))
+			return
+		}
+		if len(ids) == 0 {
+			return
 		}
 
-		logger.LogInfo(ctx, fmt.Sprintf("检测到未完成的任务数有: %v", len(tasks)))
+		tasks, err := model.GetMidjourneyTasksByIDs(ids)
+		if err != nil {
+			logger.LogError(ctx, fmt.Sprintf("load due midjourney tasks failed: %v", err))
+			return
+		}
+
+		logger.LogInfo(ctx, fmt.Sprintf("检测到待更新 Midjourney 任务数: %v, cause=%s", len(tasks), cause))
 		taskChannelM := make(map[int][]string)
 		taskM := make(map[string]*model.Midjourney)
 		nullTaskIds := make([]int, 0)
+		found := make(map[int64]bool, len(tasks))
 		for _, task := range tasks {
+			if task == nil {
+				continue
+			}
+			found[int64(task.Id)] = true
 			if task.MjId == "" {
-				// 统计失败的未完成任务
 				nullTaskIds = append(nullTaskIds, task.Id)
 				continue
 			}
@@ -51,12 +87,19 @@ func UpdateMidjourneyTaskBulk() {
 			})
 			if err != nil {
 				logger.LogError(ctx, fmt.Sprintf("Fix null mj_id task error: %v", err))
-			} else {
-				logger.LogInfo(ctx, fmt.Sprintf("Fix null mj_id task success: %v", nullTaskIds))
 			}
 		}
+		var missingIDs []int64
+		for _, id := range ids {
+			if !found[id] {
+				missingIDs = append(missingIDs, id)
+			}
+		}
+		if len(missingIDs) > 0 {
+			_ = model.RemovePendingMidjourney(missingIDs)
+		}
 		if len(taskChannelM) == 0 {
-			continue
+			return
 		}
 
 		for channelId, taskIds := range taskChannelM {
@@ -195,6 +238,57 @@ func UpdateMidjourneyTaskBulk() {
 					})
 				}
 			}
+		}
+
+		var activeIDs []int64
+		var doneIDs []int64
+		for _, task := range taskM {
+			if task == nil {
+				continue
+			}
+			if model.IsActiveMidjourneyStatus(task.Status) {
+				activeIDs = append(activeIDs, int64(task.Id))
+			} else {
+				doneIDs = append(doneIDs, int64(task.Id))
+			}
+		}
+		if len(doneIDs) > 0 {
+			_ = model.RemovePendingMidjourney(doneIDs)
+		}
+		if len(activeIDs) > 0 {
+			_ = model.SchedulePendingMidjourney(activeIDs, model.TaskPollInterval())
+		}
+	}
+
+	if backfillIDs, err := model.BackfillPendingMidjourneyIDs(constant.TaskQueryLimit); err == nil && len(backfillIDs) > 0 {
+		_ = model.SchedulePendingMidjourney(backfillIDs, 0)
+	}
+	process("startup")
+
+	for {
+		timer := time.NewTimer(model.NextPendingMidjourneyDelay(fallback))
+		select {
+		case <-timer.C:
+			process("due")
+		case <-wakeCh:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			process("event")
+		case <-backfillTicker.C:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			if backfillIDs, err := model.BackfillPendingMidjourneyIDs(constant.TaskQueryLimit); err == nil && len(backfillIDs) > 0 {
+				_ = model.SchedulePendingMidjourney(backfillIDs, 0)
+			}
+			process("fallback")
 		}
 	}
 }

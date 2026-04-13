@@ -10,13 +10,13 @@ type Midjourney struct {
 	PromptEn    string `json:"prompt_en"`
 	Description string `json:"description"`
 	State       string `json:"state"`
-	SubmitTime  int64  `json:"submit_time" gorm:"index"`
+	SubmitTime  int64  `json:"submit_time" gorm:"index;index:idx_mj_status_submit_time,priority:2"`
 	StartTime   int64  `json:"start_time" gorm:"index"`
 	FinishTime  int64  `json:"finish_time" gorm:"index"`
 	ImageUrl    string `json:"image_url"`
 	VideoUrl    string `json:"video_url"`
 	VideoUrls   string `json:"video_urls"`
-	Status      string `json:"status" gorm:"type:varchar(20);index"`
+	Status      string `json:"status" gorm:"type:varchar(20);index;index:idx_mj_status_submit_time,priority:1"`
 	Progress    string `json:"progress" gorm:"type:varchar(30);index"`
 	FailReason  string `json:"fail_reason"`
 	ChannelId   int    `json:"channel_id"`
@@ -93,12 +93,39 @@ func GetAllTasks(startIdx int, num int, queryParams TaskQueryParams) []*Midjourn
 func GetAllUnFinishTasks() []*Midjourney {
 	var tasks []*Midjourney
 	var err error
-	// get all tasks progress is not 100%
-	err = DB.Where("progress != ?", "100%").Find(&tasks).Error
+	err = DB.Select("id", "code", "user_id", "action", "mj_id", "prompt", "prompt_en", "description", "state", "submit_time", "start_time", "finish_time", "image_url", "video_url", "video_urls", "status", "progress", "fail_reason", "channel_id", "quota", "buttons", "properties").
+		Where("status NOT IN ?", []string{"SUCCESS", "FAILURE"}).
+		Find(&tasks).Error
 	if err != nil {
 		return nil
 	}
 	return tasks
+}
+
+func GetMidjourneyTasksByIDs(ids []int64) ([]*Midjourney, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	var tasks []*Midjourney
+	err := DB.Select("id", "code", "user_id", "action", "mj_id", "prompt", "prompt_en", "description", "state", "submit_time", "start_time", "finish_time", "image_url", "video_url", "video_urls", "status", "progress", "fail_reason", "channel_id", "quota", "buttons", "properties").
+		Where("id IN ?", ids).
+		Order("id").
+		Find(&tasks).Error
+	return tasks, err
+}
+
+func BackfillPendingMidjourneyIDs(limit int) ([]int64, error) {
+	if limit <= 0 {
+		limit = TaskPendingBatchSize()
+	}
+	var ids []int64
+	err := DB.Model(&Midjourney{}).
+		Select("id").
+		Where("status NOT IN ?", []string{"SUCCESS", "FAILURE"}).
+		Order("submit_time ASC").
+		Limit(limit).
+		Pluck("id", &ids).Error
+	return ids, err
 }
 
 func GetByOnlyMJId(mjId string) *Midjourney {
@@ -146,15 +173,33 @@ func UpdateProgress(id int, progress string) error {
 }
 
 func (midjourney *Midjourney) Insert() error {
-	var err error
-	err = DB.Create(midjourney).Error
-	return err
+	err := sqliteBusyRetry("midjourney insert", func() error {
+		return DB.Create(midjourney).Error
+	})
+	if err != nil {
+		return err
+	}
+	if isActiveMidjourneyStatus(midjourney.Status) {
+		_ = RegisterPendingMidjourney(int64(midjourney.Id))
+	} else {
+		_ = RemovePendingMidjourney([]int64{int64(midjourney.Id)})
+	}
+	return nil
 }
 
 func (midjourney *Midjourney) Update() error {
-	var err error
-	err = DB.Save(midjourney).Error
-	return err
+	err := sqliteBusyRetry("midjourney update", func() error {
+		return DB.Save(midjourney).Error
+	})
+	if err != nil {
+		return err
+	}
+	if isActiveMidjourneyStatus(midjourney.Status) {
+		_ = SchedulePendingMidjourney([]int64{int64(midjourney.Id)}, TaskPollInterval())
+	} else {
+		_ = RemovePendingMidjourney([]int64{int64(midjourney.Id)})
+	}
+	return nil
 }
 
 // UpdateWithStatus performs a conditional UPDATE guarded by fromStatus (CAS).
@@ -163,23 +208,63 @@ func (midjourney *Midjourney) Update() error {
 // UpdateWithStatus performs a conditional UPDATE guarded by fromStatus (CAS).
 // Uses Model().Select("*").Updates() to avoid GORM Save()'s INSERT fallback.
 func (midjourney *Midjourney) UpdateWithStatus(fromStatus string) (bool, error) {
-	result := DB.Model(midjourney).Where("status = ?", fromStatus).Select("*").Updates(midjourney)
-	if result.Error != nil {
-		return false, result.Error
+	var resultRows int64
+	err := sqliteBusyRetry("midjourney cas update", func() error {
+		result := DB.Model(midjourney).Where("status = ?", fromStatus).Select("*").Updates(midjourney)
+		if result.Error != nil {
+			return result.Error
+		}
+		resultRows = result.RowsAffected
+		return nil
+	})
+	if err != nil {
+		return false, err
 	}
-	return result.RowsAffected > 0, nil
+	if resultRows > 0 {
+		if isActiveMidjourneyStatus(midjourney.Status) {
+			_ = SchedulePendingMidjourney([]int64{int64(midjourney.Id)}, TaskPollInterval())
+		} else {
+			_ = RemovePendingMidjourney([]int64{int64(midjourney.Id)})
+		}
+	}
+	return resultRows > 0, nil
 }
 
 func MjBulkUpdate(mjIds []string, params map[string]any) error {
-	return DB.Model(&Midjourney{}).
-		Where("mj_id in (?)", mjIds).
-		Updates(params).Error
+	return sqliteBusyRetry("midjourney bulk update by mj_id", func() error {
+		return DB.Model(&Midjourney{}).
+			Where("mj_id in (?)", mjIds).
+			Updates(params).Error
+	})
 }
 
 func MjBulkUpdateByTaskIds(taskIDs []int, params map[string]any) error {
-	return DB.Model(&Midjourney{}).
-		Where("id in (?)", taskIDs).
-		Updates(params).Error
+	err := sqliteBusyRetry("midjourney bulk update by id", func() error {
+		return DB.Model(&Midjourney{}).
+			Where("id in (?)", taskIDs).
+			Updates(params).Error
+	})
+	if err != nil {
+		return err
+	}
+	ids := make([]int64, 0, len(taskIDs))
+	for _, id := range taskIDs {
+		ids = append(ids, int64(id))
+	}
+	if statusRaw, ok := params["status"].(string); ok {
+		if isActiveMidjourneyStatus(statusRaw) {
+			_ = SchedulePendingMidjourney(ids, TaskPollInterval())
+		} else {
+			_ = RemovePendingMidjourney(ids)
+		}
+		return nil
+	}
+	if progressRaw, ok := params["progress"].(string); ok && progressRaw == "100%" {
+		_ = RemovePendingMidjourney(ids)
+		return nil
+	}
+	_ = SchedulePendingMidjourney(ids, TaskPollInterval())
+	return nil
 }
 
 // CountAllTasks returns total midjourney tasks for admin query

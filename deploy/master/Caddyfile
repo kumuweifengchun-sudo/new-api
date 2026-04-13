@@ -1,0 +1,21 @@
+{
+	email {$ACME_EMAIL}
+}
+
+{$CADDY_SITE} {
+	encode zstd gzip
+
+	reverse_proxy app:3000 {
+		health_uri /api/status
+		health_interval 30s
+		health_timeout 5s
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Forwarded-Host {host}
+		header_up X-Real-IP {remote_host}
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

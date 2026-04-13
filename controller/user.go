@@ -39,6 +39,17 @@ func validateUserTokenLimits(user *model.User) error {
 	if user.MaxIpsPerToken != nil && *user.MaxIpsPerToken < 1 {
 		return errors.New("每个令牌最大使用 IP 数不能小于 1")
 	}
+	hasTotalOverride := user.ModelRequestRateLimitCountOverride != nil
+	hasSuccessOverride := user.ModelRequestRateLimitSuccessCountOverride != nil
+	if hasTotalOverride != hasSuccessOverride {
+		return errors.New("用户请求速率限制需要同时设置总请求次数和成功请求次数")
+	}
+	if hasTotalOverride && *user.ModelRequestRateLimitCountOverride < 0 {
+		return errors.New("用户每周期最多请求次数不能小于 0")
+	}
+	if hasSuccessOverride && *user.ModelRequestRateLimitSuccessCountOverride < 1 {
+		return errors.New("用户每周期最多请求完成次数不能小于 1")
+	}
 	return nil
 }
 
@@ -292,6 +303,30 @@ func GetUser(c *gin.Context) {
 		"data":    user,
 	})
 	return
+}
+
+func GetUserTokenRefsByAdmin(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	user, err := model.GetUserById(id, false)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	myRole := c.GetInt("role")
+	if myRole <= user.Role && myRole != common.RoleRootUser {
+		common.ApiErrorI18n(c, i18n.MsgUserNoPermissionSameLevel)
+		return
+	}
+	tokenRefs, err := model.GetUserTokenRefs(id)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, tokenRefs)
 }
 
 func GenerateAccessToken(c *gin.Context) {
@@ -551,7 +586,7 @@ func GetUserModels(c *gin.Context) {
 
 func UpdateUser(c *gin.Context) {
 	var updatedUser model.User
-	err := json.NewDecoder(c.Request.Body).Decode(&updatedUser)
+	err := common.DecodeJson(c.Request.Body, &updatedUser)
 	if err != nil || updatedUser.Id == 0 {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
@@ -818,7 +853,7 @@ func DeleteSelf(c *gin.Context) {
 
 func CreateUser(c *gin.Context) {
 	var user model.User
-	err := json.NewDecoder(c.Request.Body).Decode(&user)
+	err := common.DecodeJson(c.Request.Body, &user)
 	user.Username = strings.TrimSpace(user.Username)
 	if err != nil || user.Username == "" || user.Password == "" {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
@@ -842,13 +877,15 @@ func CreateUser(c *gin.Context) {
 	}
 	// Even for admin users, we cannot fully trust them!
 	cleanUser := model.User{
-		Username:          user.Username,
-		Password:          user.Password,
-		DisplayName:       user.DisplayName,
-		Role:              user.Role, // 保持管理员设置的角色
-		Remark:            user.Remark,
-		MaxTokensOverride: user.MaxTokensOverride,
-		MaxIpsPerToken:    user.MaxIpsPerToken,
+		Username:                           user.Username,
+		Password:                           user.Password,
+		DisplayName:                        user.DisplayName,
+		Role:                               user.Role, // 保持管理员设置的角色
+		Remark:                             user.Remark,
+		MaxTokensOverride:                  user.MaxTokensOverride,
+		MaxIpsPerToken:                     user.MaxIpsPerToken,
+		ModelRequestRateLimitCountOverride: user.ModelRequestRateLimitCountOverride,
+		ModelRequestRateLimitSuccessCountOverride: user.ModelRequestRateLimitSuccessCountOverride,
 	}
 	if err := cleanUser.Insert(0); err != nil {
 		common.ApiError(c, err)

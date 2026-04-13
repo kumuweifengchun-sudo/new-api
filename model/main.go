@@ -1,6 +1,7 @@
 package model
 
 import (
+	"database/sql"
 	"fmt"
 	"log"
 	"os"
@@ -64,6 +65,50 @@ func initCol() {
 var DB *gorm.DB
 
 var LOG_DB *gorm.DB
+
+type sqlPoolConfig struct {
+	MaxIdleConns int
+	MaxOpenConns int
+	MaxLifetime  time.Duration
+	MaxIdleTime  time.Duration
+}
+
+func resolveSQLPoolConfig(prefix string, sqlite bool) sqlPoolConfig {
+	if sqlite {
+		return sqlPoolConfig{
+			MaxIdleConns: 1,
+			MaxOpenConns: 1,
+		}
+	}
+
+	idleEnv := prefix + "MAX_IDLE_CONNS"
+	openEnv := prefix + "MAX_OPEN_CONNS"
+	lifeEnv := prefix + "MAX_LIFETIME"
+	idleTimeEnv := prefix + "MAX_IDLE_TIME"
+
+	if prefix == "LOG_SQL_" {
+		idleEnv = "LOG_SQL_MAX_IDLE_CONNS"
+		openEnv = "LOG_SQL_MAX_OPEN_CONNS"
+		lifeEnv = "LOG_SQL_MAX_LIFETIME"
+		idleTimeEnv = "LOG_SQL_MAX_IDLE_TIME"
+	}
+
+	return sqlPoolConfig{
+		MaxIdleConns: common.GetEnvOrDefault(idleEnv, common.GetEnvOrDefault("SQL_MAX_IDLE_CONNS", 10)),
+		MaxOpenConns: common.GetEnvOrDefault(openEnv, common.GetEnvOrDefault("SQL_MAX_OPEN_CONNS", 100)),
+		MaxLifetime:  time.Second * time.Duration(common.GetEnvOrDefault(lifeEnv, common.GetEnvOrDefault("SQL_MAX_LIFETIME", 300))),
+		MaxIdleTime:  time.Second * time.Duration(common.GetEnvOrDefault(idleTimeEnv, common.GetEnvOrDefault("SQL_MAX_IDLE_TIME", 120))),
+	}
+}
+
+func applySQLPoolConfig(name string, sqlDB *sql.DB, cfg sqlPoolConfig) {
+	sqlDB.SetMaxIdleConns(cfg.MaxIdleConns)
+	sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)
+	sqlDB.SetConnMaxLifetime(cfg.MaxLifetime)
+	sqlDB.SetConnMaxIdleTime(cfg.MaxIdleTime)
+	common.SysLog(fmt.Sprintf("%s connection pool configured: max_idle=%d max_open=%d max_lifetime=%s max_idle_time=%s",
+		name, cfg.MaxIdleConns, cfg.MaxOpenConns, cfg.MaxLifetime, cfg.MaxIdleTime))
+}
 
 func createRootAccountIfNeed() error {
 	var user User
@@ -191,9 +236,7 @@ func InitDB() (err error) {
 		if err != nil {
 			return err
 		}
-		sqlDB.SetMaxIdleConns(common.GetEnvOrDefault("SQL_MAX_IDLE_CONNS", 100))
-		sqlDB.SetMaxOpenConns(common.GetEnvOrDefault("SQL_MAX_OPEN_CONNS", 1000))
-		sqlDB.SetConnMaxLifetime(time.Second * time.Duration(common.GetEnvOrDefault("SQL_MAX_LIFETIME", 60)))
+		applySQLPoolConfig("primary DB", sqlDB, resolveSQLPoolConfig("SQL_", common.UsingSQLite))
 
 		if !common.IsMasterNode {
 			return nil
@@ -231,9 +274,7 @@ func InitLogDB() (err error) {
 		if err != nil {
 			return err
 		}
-		sqlDB.SetMaxIdleConns(common.GetEnvOrDefault("SQL_MAX_IDLE_CONNS", 100))
-		sqlDB.SetMaxOpenConns(common.GetEnvOrDefault("SQL_MAX_OPEN_CONNS", 1000))
-		sqlDB.SetConnMaxLifetime(time.Second * time.Duration(common.GetEnvOrDefault("SQL_MAX_LIFETIME", 60)))
+		applySQLPoolConfig("log DB", sqlDB, resolveSQLPoolConfig("LOG_SQL_", common.LogSqlType == common.DatabaseTypeSQLite))
 
 		if !common.IsMasterNode {
 			return nil
@@ -285,6 +326,9 @@ func migrateDB() error {
 		return err
 	}
 	if common.UsingSQLite {
+		if err := ensureUserTableColumnsSQLite(); err != nil {
+			return err
+		}
 		if err := ensureSubscriptionPlanTableSQLite(); err != nil {
 			return err
 		}
@@ -353,6 +397,9 @@ func migrateDBFast() error {
 		}
 	}
 	if common.UsingSQLite {
+		if err := ensureUserTableColumnsSQLite(); err != nil {
+			return err
+		}
 		if err := ensureSubscriptionPlanTableSQLite(); err != nil {
 			return err
 		}
@@ -437,6 +484,45 @@ PRIMARY KEY (` + "`id`" + `)
 		{Name: "quota_reset_custom_seconds", DDL: "`quota_reset_custom_seconds` bigint DEFAULT 0"},
 		{Name: "created_at", DDL: "`created_at` bigint"},
 		{Name: "updated_at", DDL: "`updated_at` bigint"},
+	}
+	for _, col := range required {
+		if _, ok := existing[col.Name]; ok {
+			continue
+		}
+		if err := DB.Exec("ALTER TABLE `" + tableName + "` ADD COLUMN " + col.DDL).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureUserTableColumnsSQLite() error {
+	if !common.UsingSQLite {
+		return nil
+	}
+	tableName := "users"
+	if !DB.Migrator().HasTable(tableName) {
+		return nil
+	}
+	var cols []struct {
+		Name string `gorm:"column:name"`
+	}
+	if err := DB.Raw("PRAGMA table_info(`" + tableName + "`)").Scan(&cols).Error; err != nil {
+		return err
+	}
+	existing := make(map[string]struct{}, len(cols))
+	for _, col := range cols {
+		existing[col.Name] = struct{}{}
+	}
+	required := []sqliteColumnDef{
+		{
+			Name: "model_request_rate_limit_count_override",
+			DDL:  "`model_request_rate_limit_count_override` integer",
+		},
+		{
+			Name: "model_request_rate_limit_success_count_override",
+			DDL:  "`model_request_rate_limit_success_count_override` integer",
+		},
 	}
 	for _, col := range required {
 		if _, ok := existing[col.Name]; ok {

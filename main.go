@@ -90,8 +90,8 @@ func main() {
 		go model.SyncChannelCache(common.SyncFrequency)
 	}
 
-	// 热更新配置
-	go model.SyncOptions(common.SyncFrequency)
+	// 配置同步由 Redis Pub/Sub 驱动；启动本地监听器即可
+	model.StartOptionSyncListener()
 
 	// 数据看板
 	go model.UpdateQuotaData()

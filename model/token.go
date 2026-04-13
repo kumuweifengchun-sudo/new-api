@@ -32,6 +32,11 @@ type Token struct {
 	DeletedAt          gorm.DeletedAt `gorm:"index"`
 }
 
+type TokenRef struct {
+	Id   int    `json:"id"`
+	Name string `json:"name"`
+}
+
 func (token *Token) Clean() {
 	token.Key = ""
 }
@@ -176,6 +181,16 @@ func GetAllUserTokens(userId int, startIdx int, num int) ([]*Token, error) {
 	var err error
 	err = DB.Where("user_id = ?", userId).Order("id desc").Limit(num).Offset(startIdx).Find(&tokens).Error
 	return tokens, err
+}
+
+func GetUserTokenRefs(userId int) ([]TokenRef, error) {
+	refs := make([]TokenRef, 0)
+	err := DB.Model(&Token{}).
+		Select("id", "name").
+		Where("user_id = ?", userId).
+		Order("id desc").
+		Find(&refs).Error
+	return refs, err
 }
 
 // sanitizeLikePattern 校验并清洗用户输入的 LIKE 搜索模式。

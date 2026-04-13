@@ -39,6 +39,28 @@ type Log struct {
 	Other            string `json:"other"`
 }
 
+type RecentUserIPItem struct {
+	IP           string     `json:"ip"`
+	LastUsedAt   int64      `json:"last_used_at"`
+	RequestCount int64      `json:"request_count"`
+	TokenCount   int64      `json:"token_count"`
+	Tokens       []TokenRef `json:"tokens"`
+}
+
+type recentUserIPAggregate struct {
+	IP           string `gorm:"column:ip"`
+	LastUsedAt   int64  `gorm:"column:last_used_at"`
+	RequestCount int64  `gorm:"column:request_count"`
+	TokenCount   int64  `gorm:"column:token_count"`
+}
+
+type recentUserIPTokenAggregate struct {
+	IP         string `gorm:"column:ip"`
+	TokenId    int    `gorm:"column:token_id"`
+	TokenName  string `gorm:"column:token_name"`
+	LastUsedAt int64  `gorm:"column:last_used_at"`
+}
+
 // don't use iota, avoid change log type value
 const (
 	LogTypeUnknown = 0
@@ -96,13 +118,6 @@ func RecordErrorLog(c *gin.Context, userId int, channelId int, modelName string,
 	username := c.GetString("username")
 	requestId := c.GetString(common.RequestIdKey)
 	otherStr := common.MapToJsonStr(other)
-	// 判断是否需要记录 IP
-	needRecordIp := false
-	if settingMap, err := GetUserSetting(userId, false); err == nil {
-		if settingMap.RecordIpLog {
-			needRecordIp = true
-		}
-	}
 	log := &Log{
 		UserId:           userId,
 		Username:         username,
@@ -119,14 +134,9 @@ func RecordErrorLog(c *gin.Context, userId int, channelId int, modelName string,
 		UseTime:          useTimeSeconds,
 		IsStream:         isStream,
 		Group:            group,
-		Ip: func() string {
-			if needRecordIp {
-				return c.ClientIP()
-			}
-			return ""
-		}(),
-		RequestId: requestId,
-		Other:     otherStr,
+		Ip:               c.ClientIP(),
+		RequestId:        requestId,
+		Other:            otherStr,
 	}
 	err := LOG_DB.Create(log).Error
 	if err != nil {
@@ -157,13 +167,6 @@ func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams)
 	username := c.GetString("username")
 	requestId := c.GetString(common.RequestIdKey)
 	otherStr := common.MapToJsonStr(params.Other)
-	// 判断是否需要记录 IP
-	needRecordIp := false
-	if settingMap, err := GetUserSetting(userId, false); err == nil {
-		if settingMap.RecordIpLog {
-			needRecordIp = true
-		}
-	}
 	log := &Log{
 		UserId:           userId,
 		Username:         username,
@@ -180,14 +183,9 @@ func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams)
 		UseTime:          params.UseTimeSeconds,
 		IsStream:         params.IsStream,
 		Group:            params.Group,
-		Ip: func() string {
-			if needRecordIp {
-				return c.ClientIP()
-			}
-			return ""
-		}(),
-		RequestId: requestId,
-		Other:     otherStr,
+		Ip:               c.ClientIP(),
+		RequestId:        requestId,
+		Other:            otherStr,
 	}
 	err := LOG_DB.Create(log).Error
 	if err != nil {
@@ -372,6 +370,96 @@ func GetUserLogs(userId int, logType int, startTimestamp int64, endTimestamp int
 
 	formatUserLogs(logs, startIdx)
 	return logs, total, err
+}
+
+func buildRecentUserIPBaseQuery(userId int, startTimestamp int64, endTimestamp int64, tokenId int) *gorm.DB {
+	tx := LOG_DB.Model(&Log{}).
+		Where("logs.user_id = ?", userId).
+		Where("logs.type IN ?", []int{LogTypeConsume, LogTypeError}).
+		Where("logs.ip <> ''")
+
+	if startTimestamp != 0 {
+		tx = tx.Where("logs.created_at >= ?", startTimestamp)
+	}
+	if endTimestamp != 0 {
+		tx = tx.Where("logs.created_at <= ?", endTimestamp)
+	}
+	if tokenId != 0 {
+		tx = tx.Where("logs.token_id = ?", tokenId)
+	}
+	return tx
+}
+
+func GetRecentUserIPs(userId int, startTimestamp int64, endTimestamp int64, tokenId int, startIdx int, num int) ([]RecentUserIPItem, int64, error) {
+	baseQuery := buildRecentUserIPBaseQuery(userId, startTimestamp, endTimestamp, tokenId)
+
+	var total int64
+	if err := baseQuery.Distinct("logs.ip").Count(&total).Error; err != nil {
+		common.SysError("failed to count recent user ips: " + err.Error())
+		return nil, 0, errors.New("查询最近活跃 IP 失败")
+	}
+	if total == 0 {
+		return make([]RecentUserIPItem, 0), 0, nil
+	}
+
+	aggregates := make([]recentUserIPAggregate, 0)
+	err := baseQuery.
+		Select("logs.ip, MAX(logs.created_at) AS last_used_at, COUNT(*) AS request_count, COUNT(DISTINCT logs.token_id) AS token_count").
+		Group("logs.ip").
+		Order("last_used_at desc").
+		Limit(num).
+		Offset(startIdx).
+		Scan(&aggregates).Error
+	if err != nil {
+		common.SysError("failed to load recent user ips: " + err.Error())
+		return nil, 0, errors.New("查询最近活跃 IP 失败")
+	}
+	if len(aggregates) == 0 {
+		return make([]RecentUserIPItem, 0), total, nil
+	}
+
+	ips := make([]string, 0, len(aggregates))
+	items := make([]RecentUserIPItem, 0, len(aggregates))
+	for _, aggregate := range aggregates {
+		ips = append(ips, aggregate.IP)
+		items = append(items, RecentUserIPItem{
+			IP:           aggregate.IP,
+			LastUsedAt:   aggregate.LastUsedAt,
+			RequestCount: aggregate.RequestCount,
+			TokenCount:   aggregate.TokenCount,
+			Tokens:       make([]TokenRef, 0),
+		})
+	}
+
+	tokenAggregates := make([]recentUserIPTokenAggregate, 0)
+	err = buildRecentUserIPBaseQuery(userId, startTimestamp, endTimestamp, tokenId).
+		Where("logs.ip IN ?", ips).
+		Where("logs.token_id <> 0").
+		Select("logs.ip, logs.token_id, logs.token_name, MAX(logs.created_at) AS last_used_at").
+		Group("logs.ip, logs.token_id, logs.token_name").
+		Order("last_used_at desc").
+		Scan(&tokenAggregates).Error
+	if err != nil {
+		common.SysError("failed to load recent user ip tokens: " + err.Error())
+		return nil, 0, errors.New("查询最近活跃 IP 失败")
+	}
+
+	tokenMapByIP := make(map[string][]TokenRef, len(ips))
+	for _, aggregate := range tokenAggregates {
+		name := aggregate.TokenName
+		if name == "" {
+			name = fmt.Sprintf("#%d", aggregate.TokenId)
+		}
+		tokenMapByIP[aggregate.IP] = append(tokenMapByIP[aggregate.IP], TokenRef{
+			Id:   aggregate.TokenId,
+			Name: name,
+		})
+	}
+
+	for i := range items {
+		items[i].Tokens = tokenMapByIP[items[i].IP]
+	}
+	return items, total, nil
 }
 
 type Stat struct {

@@ -21,13 +21,59 @@ type QuotaData struct {
 	Quota     int    `json:"quota" gorm:"default:0"`
 }
 
+var quotaDataFlushSignal = make(chan struct{}, 1)
+
+func quotaDataFlushThreshold() int {
+	return common.GetEnvOrDefault("QUOTA_DATA_FLUSH_THRESHOLD", 200)
+}
+
+func quotaDataFlushDebounce() time.Duration {
+	return time.Duration(common.GetEnvOrDefault("QUOTA_DATA_FLUSH_DEBOUNCE_SECONDS", 5)) * time.Second
+}
+
+func signalQuotaDataFlush() {
+	select {
+	case quotaDataFlushSignal <- struct{}{}:
+	default:
+	}
+}
+
 func UpdateQuotaData() {
+	fallbackTicker := time.NewTicker(time.Duration(common.DataExportInterval) * time.Minute)
+	defer fallbackTicker.Stop()
+
+	debounce := time.NewTimer(quotaDataFlushDebounce())
+	if !debounce.Stop() {
+		<-debounce.C
+	}
+	debounceArmed := false
+
 	for {
-		if common.DataExportEnabled {
-			common.SysLog("正在更新数据看板数据...")
-			SaveQuotaDataCache()
+		select {
+		case <-quotaDataFlushSignal:
+			if !common.DataExportEnabled {
+				continue
+			}
+			if debounceArmed && !debounce.Stop() {
+				select {
+				case <-debounce.C:
+				default:
+				}
+			}
+			debounce.Reset(quotaDataFlushDebounce())
+			debounceArmed = true
+		case <-debounce.C:
+			debounceArmed = false
+			if common.DataExportEnabled {
+				common.SysLog("正在按事件刷新数据看板数据...")
+				SaveQuotaDataCache()
+			}
+		case <-fallbackTicker.C:
+			if common.DataExportEnabled {
+				common.SysLog("正在按兜底周期刷新数据看板数据...")
+				SaveQuotaDataCache()
+			}
 		}
-		time.Sleep(time.Duration(common.DataExportInterval) * time.Minute)
 	}
 }
 
@@ -60,14 +106,25 @@ func LogQuotaData(userId int, username string, modelName string, quota int, crea
 	createdAt = createdAt - (createdAt % 3600)
 
 	CacheQuotaDataLock.Lock()
-	defer CacheQuotaDataLock.Unlock()
 	logQuotaDataCache(userId, username, modelName, quota, createdAt, tokenUsed)
+	size := len(CacheQuotaData)
+	CacheQuotaDataLock.Unlock()
+
+	if size >= quotaDataFlushThreshold() {
+		signalQuotaDataFlush()
+		return
+	}
+	signalQuotaDataFlush()
 }
 
 func SaveQuotaDataCache() {
 	CacheQuotaDataLock.Lock()
-	defer CacheQuotaDataLock.Unlock()
 	size := len(CacheQuotaData)
+	if size == 0 {
+		CacheQuotaDataLock.Unlock()
+		return
+	}
+	defer CacheQuotaDataLock.Unlock()
 	// 如果缓存中有数据，就保存到数据库中
 	// 1. 先查询数据库中是否有数据
 	// 2. 如果有数据，就更新数据

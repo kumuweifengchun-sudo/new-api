@@ -14,6 +14,34 @@ import (
 
 type TaskStatus string
 
+func taskSelectColumns() []string {
+	groupCol := commonGroupCol
+	if groupCol == "" {
+		groupCol = "`group`"
+	}
+	return []string{
+		"id",
+		"created_at",
+		"updated_at",
+		"task_id",
+		"platform",
+		"user_id",
+		groupCol,
+		"channel_id",
+		"quota",
+		"action",
+		"status",
+		"fail_reason",
+		"submit_time",
+		"start_time",
+		"finish_time",
+		"progress",
+		"properties",
+		"private_data",
+		"data",
+	}
+}
+
 func (t TaskStatus) ToVideoStatus() string {
 	var status string
 	switch t {
@@ -44,17 +72,17 @@ const (
 type Task struct {
 	ID         int64                 `json:"id" gorm:"primary_key;AUTO_INCREMENT"`
 	CreatedAt  int64                 `json:"created_at" gorm:"index"`
-	UpdatedAt  int64                 `json:"updated_at"`
+	UpdatedAt  int64                 `json:"updated_at" gorm:"index:idx_task_status_updated_at,priority:2"`
 	TaskID     string                `json:"task_id" gorm:"type:varchar(191);index"` // 第三方id，不一定有/ song id\ Task id
 	Platform   constant.TaskPlatform `json:"platform" gorm:"type:varchar(30);index"` // 平台
 	UserId     int                   `json:"user_id" gorm:"index"`
 	Group      string                `json:"group" gorm:"type:varchar(50)"` // 修正计费用
 	ChannelId  int                   `json:"channel_id" gorm:"index"`
 	Quota      int                   `json:"quota"`
-	Action     string                `json:"action" gorm:"type:varchar(40);index"` // 任务类型, song, lyrics, description-mode
-	Status     TaskStatus            `json:"status" gorm:"type:varchar(20);index"` // 任务状态
+	Action     string                `json:"action" gorm:"type:varchar(40);index"`                                                                                          // 任务类型, song, lyrics, description-mode
+	Status     TaskStatus            `json:"status" gorm:"type:varchar(20);index;index:idx_task_status_submit_time,priority:1;index:idx_task_status_updated_at,priority:1"` // 任务状态
 	FailReason string                `json:"fail_reason"`
-	SubmitTime int64                 `json:"submit_time" gorm:"index"`
+	SubmitTime int64                 `json:"submit_time" gorm:"index;index:idx_task_status_submit_time,priority:2"`
 	StartTime  int64                 `json:"start_time" gorm:"index"`
 	FinishTime int64                 `json:"finish_time" gorm:"index"`
 	Progress   string                `json:"progress" gorm:"type:varchar(20);index"`
@@ -291,8 +319,8 @@ func TaskGetAllTasks(startIdx int, num int, queryParams SyncTaskQueryParams) []*
 
 func GetTimedOutUnfinishedTasks(cutoffUnix int64, limit int) []*Task {
 	var tasks []*Task
-	err := DB.Where("progress != ?", "100%").
-		Where("status NOT IN ?", []string{TaskStatusFailure, TaskStatusSuccess}).
+	err := DB.Select(taskSelectColumns()).
+		Where("status IN ?", activeTaskStatuses()).
 		Where("submit_time < ?", cutoffUnix).
 		Order("submit_time").
 		Limit(limit).
@@ -306,12 +334,41 @@ func GetTimedOutUnfinishedTasks(cutoffUnix int64, limit int) []*Task {
 func GetAllUnFinishSyncTasks(limit int) []*Task {
 	var tasks []*Task
 	var err error
-	// get all tasks progress is not 100%
-	err = DB.Where("progress != ?", "100%").Where("status != ?", TaskStatusFailure).Where("status != ?", TaskStatusSuccess).Limit(limit).Order("id").Find(&tasks).Error
+	err = DB.Select(taskSelectColumns()).
+		Where("status IN ?", activeTaskStatuses()).
+		Limit(limit).
+		Order("id").
+		Find(&tasks).Error
 	if err != nil {
 		return nil
 	}
 	return tasks
+}
+
+func GetTasksByIDs(ids []int64) ([]*Task, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	var tasks []*Task
+	err := DB.Select(taskSelectColumns()).
+		Where("id IN ?", ids).
+		Order("id").
+		Find(&tasks).Error
+	return tasks, err
+}
+
+func BackfillPendingTaskIDs(limit int) ([]int64, error) {
+	if limit <= 0 {
+		limit = TaskPendingBatchSize()
+	}
+	var ids []int64
+	err := DB.Model(&Task{}).
+		Select("id").
+		Where("status IN ?", activeTaskStatuses()).
+		Order("updated_at ASC").
+		Limit(limit).
+		Pluck("id", &ids).Error
+	return ids, err
 }
 
 func GetByOnlyTaskId(taskId string) (*Task, bool, error) {
@@ -358,9 +415,18 @@ func GetByTaskIds(userId int, taskIds []any) ([]*Task, error) {
 }
 
 func (Task *Task) Insert() error {
-	var err error
-	err = DB.Create(Task).Error
-	return err
+	err := sqliteBusyRetry("task insert", func() error {
+		return DB.Create(Task).Error
+	})
+	if err != nil {
+		return err
+	}
+	if isActiveTaskStatus(Task.Status) {
+		_ = RegisterPendingTask(Task.ID)
+	} else {
+		_ = RemovePendingTasks([]int64{Task.ID})
+	}
+	return nil
 }
 
 type taskSnapshot struct {
@@ -396,9 +462,18 @@ func (t *Task) Snapshot() taskSnapshot {
 }
 
 func (Task *Task) Update() error {
-	var err error
-	err = DB.Save(Task).Error
-	return err
+	err := sqliteBusyRetry("task update", func() error {
+		return DB.Save(Task).Error
+	})
+	if err != nil {
+		return err
+	}
+	if isActiveTaskStatus(Task.Status) {
+		_ = SchedulePendingTasks([]int64{Task.ID}, TaskPollInterval())
+	} else {
+		_ = RemovePendingTasks([]int64{Task.ID})
+	}
+	return nil
 }
 
 // UpdateWithStatus performs a conditional UPDATE guarded by fromStatus (CAS).
@@ -409,11 +484,26 @@ func (Task *Task) Update() error {
 // falls back to INSERT ON CONFLICT when the WHERE-guarded UPDATE matches
 // zero rows, which silently bypasses the CAS guard.
 func (t *Task) UpdateWithStatus(fromStatus TaskStatus) (bool, error) {
-	result := DB.Model(t).Where("status = ?", fromStatus).Select("*").Updates(t)
-	if result.Error != nil {
-		return false, result.Error
+	var resultRows int64
+	err := sqliteBusyRetry("task cas update", func() error {
+		result := DB.Model(t).Where("status = ?", fromStatus).Select("*").Updates(t)
+		if result.Error != nil {
+			return result.Error
+		}
+		resultRows = result.RowsAffected
+		return nil
+	})
+	if err != nil {
+		return false, err
 	}
-	return result.RowsAffected > 0, nil
+	if resultRows > 0 {
+		if isActiveTaskStatus(t.Status) {
+			_ = SchedulePendingTasks([]int64{t.ID}, TaskPollInterval())
+		} else {
+			_ = RemovePendingTasks([]int64{t.ID})
+		}
+	}
+	return resultRows > 0, nil
 }
 
 // TaskBulkUpdateByID performs an unconditional bulk UPDATE by primary key IDs.
@@ -425,9 +515,38 @@ func TaskBulkUpdateByID(ids []int64, params map[string]any) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	return DB.Model(&Task{}).
-		Where("id in (?)", ids).
-		Updates(params).Error
+	err := sqliteBusyRetry("task bulk update", func() error {
+		return DB.Model(&Task{}).
+			Where("id in (?)", ids).
+			Updates(params).Error
+	})
+	if err != nil {
+		return err
+	}
+	if statusRaw, ok := params["status"]; ok {
+		if status, ok := statusRaw.(TaskStatus); ok {
+			if isActiveTaskStatus(status) {
+				_ = SchedulePendingTasks(ids, TaskPollInterval())
+			} else {
+				_ = RemovePendingTasks(ids)
+			}
+			return nil
+		}
+		if statusStr, ok := statusRaw.(string); ok {
+			if isActiveTaskStatus(TaskStatus(statusStr)) {
+				_ = SchedulePendingTasks(ids, TaskPollInterval())
+			} else {
+				_ = RemovePendingTasks(ids)
+			}
+			return nil
+		}
+	}
+	if progressRaw, ok := params["progress"].(string); ok && progressRaw == "100%" {
+		_ = RemovePendingTasks(ids)
+		return nil
+	}
+	_ = SchedulePendingTasks(ids, TaskPollInterval())
+	return nil
 }
 
 type TaskQuotaUsage struct {

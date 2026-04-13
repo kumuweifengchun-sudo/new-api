@@ -1,0 +1,23 @@
+{
+	email {$ACME_EMAIL}
+}
+
+{$CADDY_SITE} {
+	encode zstd gzip
+
+	reverse_proxy {$SLAVE_UPSTREAMS} {
+		lb_policy round_robin
+		health_uri /api/status
+		health_interval 15s
+		health_timeout 5s
+		fail_duration 30s
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Forwarded-Host {host}
+		header_up X-Real-IP {remote_host}
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

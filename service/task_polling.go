@@ -87,53 +87,194 @@ func sweepTimedOutTasks(ctx context.Context) {
 	}
 }
 
-// TaskPollingLoop 主轮询循环，每 15 秒检查一次未完成的任务
-func TaskPollingLoop() {
-	for {
-		time.Sleep(time.Duration(15) * time.Second)
-		common.SysLog("任务进度轮询开始")
-		ctx := context.TODO()
-		sweepTimedOutTasks(ctx)
-		allTasks := model.GetAllUnFinishSyncTasks(constant.TaskQueryLimit)
-		platformTask := make(map[constant.TaskPlatform][]*model.Task)
-		for _, t := range allTasks {
-			platformTask[t.Platform] = append(platformTask[t.Platform], t)
+func timeoutTaskIfNeeded(ctx context.Context, task *model.Task, now time.Time) bool {
+	if constant.TaskTimeoutMinutes <= 0 || task == nil || !model.IsActiveTaskStatus(task.Status) {
+		return false
+	}
+	cutoff := now.Unix() - int64(constant.TaskTimeoutMinutes)*60
+	if task.SubmitTime <= 0 || task.SubmitTime >= cutoff {
+		return false
+	}
+
+	const legacyTaskCutoff int64 = 1740182400 // 2026-02-22 00:00:00 UTC
+	reason := fmt.Sprintf("任务超时（%d分钟）", constant.TaskTimeoutMinutes)
+	legacyReason := "任务超时（旧系统遗留任务，不进行退款，请联系管理员）"
+	isLegacy := task.SubmitTime < legacyTaskCutoff
+
+	oldStatus := task.Status
+	task.Status = model.TaskStatusFailure
+	task.Progress = "100%"
+	task.FinishTime = now.Unix()
+	if isLegacy {
+		task.FailReason = legacyReason
+	} else {
+		task.FailReason = reason
+	}
+
+	won, err := task.UpdateWithStatus(oldStatus)
+	if err != nil {
+		logger.LogError(ctx, fmt.Sprintf("timeout CAS update error for task %s: %v", task.TaskID, err))
+		return true
+	}
+	if !won {
+		logger.LogInfo(ctx, fmt.Sprintf("timeoutTaskIfNeeded: task %s already transitioned, skip", task.TaskID))
+		return true
+	}
+	if !isLegacy && task.Quota != 0 {
+		RefundTaskQuota(ctx, task, reason)
+	}
+	return true
+}
+
+func processPendingTasks(ctx context.Context, cause string) {
+	ids, err := model.FetchDuePendingTaskIDs(constant.TaskQueryLimit)
+	if err != nil {
+		logger.LogError(ctx, fmt.Sprintf("fetch due pending tasks failed: %v", err))
+		return
+	}
+	if len(ids) == 0 {
+		return
+	}
+
+	tasks, err := model.GetTasksByIDs(ids)
+	if err != nil {
+		logger.LogError(ctx, fmt.Sprintf("load due pending tasks failed: %v", err))
+		return
+	}
+
+	found := make(map[int64]bool, len(tasks))
+	platformTask := make(map[constant.TaskPlatform][]*model.Task)
+	for _, task := range tasks {
+		if task == nil {
+			continue
 		}
-		for platform, tasks := range platformTask {
-			if len(tasks) == 0 {
+		found[task.ID] = true
+		if timeoutTaskIfNeeded(ctx, task, time.Now()) {
+			continue
+		}
+		platformTask[task.Platform] = append(platformTask[task.Platform], task)
+	}
+
+	var missingIDs []int64
+	for _, id := range ids {
+		if !found[id] {
+			missingIDs = append(missingIDs, id)
+		}
+	}
+	if len(missingIDs) > 0 {
+		_ = model.RemovePendingTasks(missingIDs)
+	}
+
+	for platform, tasks := range platformTask {
+		if len(tasks) == 0 {
+			continue
+		}
+		taskChannelM := make(map[int][]string)
+		taskM := make(map[string]*model.Task)
+		nullTaskIds := make([]int64, 0)
+		for _, task := range tasks {
+			upstreamID := task.GetUpstreamTaskID()
+			if upstreamID == "" {
+				nullTaskIds = append(nullTaskIds, task.ID)
 				continue
 			}
-			taskChannelM := make(map[int][]string)
-			taskM := make(map[string]*model.Task)
-			nullTaskIds := make([]int64, 0)
-			for _, task := range tasks {
-				upstreamID := task.GetUpstreamTaskID()
-				if upstreamID == "" {
-					// 统计失败的未完成任务
-					nullTaskIds = append(nullTaskIds, task.ID)
+			taskM[upstreamID] = task
+			taskChannelM[task.ChannelId] = append(taskChannelM[task.ChannelId], upstreamID)
+		}
+		if len(nullTaskIds) > 0 {
+			err := model.TaskBulkUpdateByID(nullTaskIds, map[string]any{
+				"status":   model.TaskStatusFailure,
+				"progress": "100%",
+			})
+			if err != nil {
+				logger.LogError(ctx, fmt.Sprintf("Fix null task_id task error: %v", err))
+			}
+		}
+		if len(taskChannelM) == 0 {
+			continue
+		}
+		DispatchPlatformUpdate(platform, taskChannelM, taskM)
+
+		var activeIDs []int64
+		var doneIDs []int64
+		for _, task := range taskM {
+			if task == nil {
+				continue
+			}
+			if model.IsActiveTaskStatus(task.Status) {
+				activeIDs = append(activeIDs, task.ID)
+			} else {
+				doneIDs = append(doneIDs, task.ID)
+			}
+		}
+		if len(doneIDs) > 0 {
+			_ = model.RemovePendingTasks(doneIDs)
+		}
+		if len(activeIDs) > 0 {
+			_ = model.SchedulePendingTasks(activeIDs, model.TaskPollInterval())
+		}
+	}
+
+	logger.LogDebug(ctx, "task polling processed: cause=%s count=%d", cause, len(ids))
+}
+
+// TaskPollingLoop 使用 Redis 事件 + 待轮询集合驱动任务更新，低频兜底回补活动任务。
+func TaskPollingLoop() {
+	ctx := context.Background()
+	fallback := model.TaskFallbackInterval()
+	backfillTicker := time.NewTicker(fallback)
+	defer backfillTicker.Stop()
+
+	wakeCh := make(chan struct{}, 1)
+	if pubsub := model.SubscribeTaskSync(); pubsub != nil {
+		go func() {
+			defer pubsub.Close()
+			for msg := range pubsub.Channel() {
+				var event model.TaskSyncEvent
+				if err := common.UnmarshalJsonStr(msg.Payload, &event); err != nil {
 					continue
 				}
-				taskM[upstreamID] = task
-				taskChannelM[task.ChannelId] = append(taskChannelM[task.ChannelId], upstreamID)
-			}
-			if len(nullTaskIds) > 0 {
-				err := model.TaskBulkUpdateByID(nullTaskIds, map[string]any{
-					"status":   "FAILURE",
-					"progress": "100%",
-				})
-				if err != nil {
-					logger.LogError(ctx, fmt.Sprintf("Fix null task_id task error: %v", err))
-				} else {
-					logger.LogInfo(ctx, fmt.Sprintf("Fix null task_id task success: %v", nullTaskIds))
+				if event.Kind != "task" {
+					continue
+				}
+				select {
+				case wakeCh <- struct{}{}:
+				default:
 				}
 			}
-			if len(taskChannelM) == 0 {
-				continue
-			}
+		}()
+	}
 
-			DispatchPlatformUpdate(platform, taskChannelM, taskM)
+	if backfillIDs, err := model.BackfillPendingTaskIDs(constant.TaskQueryLimit); err == nil && len(backfillIDs) > 0 {
+		_ = model.SchedulePendingTasks(backfillIDs, 0)
+	}
+	processPendingTasks(ctx, "startup")
+
+	for {
+		timer := time.NewTimer(model.NextPendingTaskDelay(fallback))
+		select {
+		case <-timer.C:
+			processPendingTasks(ctx, "due")
+		case <-wakeCh:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			processPendingTasks(ctx, "event")
+		case <-backfillTicker.C:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			if backfillIDs, err := model.BackfillPendingTaskIDs(constant.TaskQueryLimit); err == nil && len(backfillIDs) > 0 {
+				_ = model.SchedulePendingTasks(backfillIDs, 0)
+			}
+			processPendingTasks(ctx, "fallback")
 		}
-		common.SysLog("任务进度轮询完成")
 	}
 }
 
